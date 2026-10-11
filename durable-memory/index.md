@@ -2,6 +2,10 @@
 
 Short decision notes; the code and README are the reference.
 
-- [decisions.md](decisions.md): design decisions of phase 1 and why.
-- [safety.md](safety.md): the read-only guards, what each test proves, and the mutation check.
-- [phase2.md](phase2.md): what Postgres needs and the open questions.
+- [open-mode.md](open-mode.md): the CURRENT design — v1 runs any SQL; the policy seam; where the
+  guards went. Start here.
+- [decisions.md](decisions.md): phase-1 SQLite design decisions (much still applies: type mapping,
+  caps, connections).
+- [safety.md](safety.md): HISTORICAL — the read-only guards and their mutation check, removed in
+  open mode (in git history, planned to return behind config).
+- [phase2.md](phase2.md): HISTORICAL — the original Postgres safety plan.

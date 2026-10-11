@@ -1,159 +1,135 @@
 # lmsql
 
-One SQL statement in, structured JSON out. `lmsql` is a deliberately small database CLI for
-LLMs and the programs that drive them: no shell, no cursors, no sessions, no stored procedures.
-Every call opens the database, runs exactly one statement under hard limits, prints one JSON
-document and exits.
+One SQL request in, structured JSON out. `lmsql` is a small database CLI for LLMs and the programs
+that drive them: no shell, no sessions, no prompts. Every call opens the database, runs the SQL it
+is given, prints one JSON document and exits.
 
-It is a native [lmapi](https://github.com/lmctl-ai/lmapi) tool (`cli.schema.v1`), built on the
-Rust SDK [lmrust](https://github.com/lmctl-ai/lmrust): `lmsql --schema` publishes the contract,
-and an agent can call it through any lmapi client with validated flags or JSON.
+It is a native [lmapi](https://github.com/lmctl-ai/lmapi) tool (`cli.schema.v1`), built on the Rust
+SDK [lmrust](https://github.com/lmctl-ai/lmrust): `lmsql --schema` publishes the contract, and an
+agent calls it through any lmapi client with validated flags or JSON.
 
-Phase 1 supports **SQLite** (bundled; no system library needed). Postgres is planned.
+Backends: **SQLite** (bundled; no system library) and **PostgreSQL** (rustls TLS).
 
 ```sh
 lmsql query --db app.sqlite "SELECT id, name FROM users ORDER BY id LIMIT 5"
-lmsql tables --db app.sqlite
+lmsql exec  --db app.sqlite "UPDATE users SET active = 0 WHERE id = 7"
+lmsql tables   --db app.sqlite
 lmsql describe --db app.sqlite users
-lmsql exec --db app.sqlite "UPDATE users SET active = 0 WHERE id = 7" --confirm
+export LMSQL_PROD="postgres://reader@db.internal/app?sslmode=verify-full"
+lmsql query --connection prod "SELECT now()"
 ```
 
-## Why
+## Open mode (v1)
 
-An LLM that can run SQL needs three guarantees a normal client does not give: a read can never
-write, one call is one statement, and the answer is bounded and machine-readable. lmsql makes
-those properties of the tool, not of the prompt.
+This version runs **any SQL the database accepts**. There is no in-tool restriction on what a
+statement may do: `query` and `exec` are identical in power (both run reads, writes and DDL), and
+SQLite is opened read-write (the file is created if missing). This is deliberate — lmsql v1 is the
+owner's tool on the owner's databases, meant to work end to end; usage limits will come later as
+configuration through the `Policy` seam (`src/policy.rs`, which today allows everything and records
+`LMSQL_CONFIG` for the future).
 
-## Safety model
+**To restrict what a connection can do, use the database itself:** connect PostgreSQL as a
+read-only role, or point `--db` at a SQLite file opened by a user without write permission. An
+earlier version enforced read-only and single-statement rules inside lmsql; that code lives in git
+history (branch `phase2-postgres`, commit `0a3877f`) and is planned to return behind config.
 
-| Guarantee | How |
-| --- | --- |
-| `query`, `tables`, `describe` cannot write | four independent guards, each enough alone: the file is opened `SQLITE_OPEN_READ_ONLY`; `PRAGMA query_only = ON`; `query` refuses statements `sqlite3_stmt_readonly` does not call read-only (`NOT_READ_ONLY`); an authorizer refuses ATTACH/DETACH, PRAGMA assignments and `load_extension` |
-| The database file is never changed by a read, and no other database is touched | `SQLITE_LIMIT_ATTACHED = 0` on every connection (no `ATTACH`, no `VACUUM INTO`); `file:` names are literal paths, never URIs. One exception to "no file is created": reading a **WAL-mode** database makes SQLite create its `-wal` and `-shm` coordination files when they are missing (SQLite cannot read a WAL database safely without them unless it is opened `immutable`, which is unsafe next to a writer). They hold no changes from the read. If the directory is read-only, the read fails with `DIRECTORY_READONLY` |
-| Only real database files | `--db` must be an existing regular file (symlinks are followed; a symlinked database is legitimate). Directories, devices and fifos are refused with `NOT_A_REGULAR_FILE` before anything is opened (a fifo can never block the call); `:memory:` and blank names are `INVALID_DB_PATH`, also for `exec --create` |
-| No schema corruption, no untrusted schema code | `SQLITE_DBCONFIG_DEFENSIVE` on, `SQLITE_DBCONFIG_TRUSTED_SCHEMA` off |
-| No extensions | extension loading is never enabled, and the `load_extension` function is denied |
-| Exactly one statement | prepared with `sqlite3_prepare_v2`; anything in its tail other than whitespace and comments is `TOO_MANY_STATEMENTS` (nothing runs); empty input is `EMPTY_STATEMENT`; a NUL byte is `NUL_IN_STATEMENT` |
-| Bounded answers | `maxRows` (default 200, hard cap 10 000), `maxBytes` (default 1 MiB, hard cap 16 MiB): when hit, `truncated: true` and `truncated_by` say so; nothing is dropped silently. Values above a hard cap are refused, not clamped |
-| Bounded time | `timeoutMs` (default 10 s, cap 300 s) is one deadline for the whole call: a busy handler stops waiting for a lock at it (`SQLITE_BUSY`, exit 5) and a progress handler, checked every 1000 VM steps, interrupts the statement at it (`TIMEOUT`, exit 7). A single VM step (one builtin call such as `printf` or `randomblob`) cannot be interrupted; the size limits below bound it |
-| Bounded memory | every connection: values at most 32 MiB (`SQLITE_LIMIT_LENGTH`, twice the hard `maxBytes`), statements at most 16 MiB, expression depth 500, compound SELECT 200 terms, LIKE patterns 10 000 bytes; the process: a hard SQLite heap limit of 256 MiB. Larger values fail with `SQLITE_TOOBIG` before they are allocated (SQLite's `printf()` returns `NULL` instead), an over-large working set with `SQLITE_NOMEM` |
-| Writes need intent | `exec` is the only write path; it is `access: write` and dangerous, so it needs `--confirm`; `--dryrun` and `LMSQL_DRYRUN=1` simulate it, `--readonly` and `LMSQL_READONLY=1` refuse it |
-| No secret echo | database paths and connection values never appear in results or errors: lmsql's own messages never contain them, and SQLite messages have the path replaced by `<db>` where it appears as a whole token |
+### A recommended read-only PostgreSQL role
 
-Every guard has its own test, and a mutation check (each guard removed in turn) fails a test for
-every one of them; see `durable-memory/safety.md`.
+```sql
+CREATE ROLE lmsql_ro LOGIN PASSWORD '...';
+GRANT CONNECT ON DATABASE app TO lmsql_ro;
+GRANT USAGE ON SCHEMA public TO lmsql_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO lmsql_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO lmsql_ro;
+ALTER ROLE lmsql_ro SET default_transaction_read_only = on;
+```
+
+## What is still enforced: operational caps
+
+These bound the *result and the time*, not what SQL may do (they protect the LLM's context and the
+process, not the database):
+
+| Cap | Default | Meaning |
+| --- | --- | --- |
+| `--max-rows` | 200 | stop fetching after this many rows; `truncated: true`, `truncated_by: "max_rows"`. A single row-returning statement is read through a cursor (SQLite) or a server cursor (PostgreSQL), so a 5-million-row `SELECT` stops in milliseconds without materializing. |
+| `--max-bytes` | 1 MiB | stop when the serialized rows reach this size (`truncated_by: "max_bytes"`). |
+| `--timeout-ms` | 10 s | one deadline for the call: SQLite busy-wait + a progress handler that interrupts a long statement (`TIMEOUT`, exit 7); PostgreSQL `statement_timeout`/`lock_timeout`/`connect_timeout` plus a watchdog that sends a cancel request at the deadline. |
+
+Errors are lmapi envelopes on stdout (`{"success": false, "error": {"code", "message", "data":
+{"tool_code", ...}}}`) with the backend's code in `tool_code` (`SQLITE_*`, `PG_<SQLSTATE>`, or
+`TIMEOUT` / `CONNECT_FAILED`). A database path or DSN (user, host, password) never appears in a
+result or an error message.
 
 ## Operations
 
-All operations take the database as `--db PATH` or `--connection NAME` (exactly one), and the
-`--input-json '{...}'` / `--input-file` forms of lmapi. Errors are lmapi envelopes on stdout
-(`{"success": false, "error": {"code", "message", "data": {"tool_code", ...}}}`) with lmapi exit
-codes.
+All take the database as `--db` or `--connection NAME`, and accept the `--input-json` /
+`--input-file` forms of lmapi. Every result has one shape:
 
-### `query` (read)
-
-One read-only statement: `SELECT`, `WITH ... SELECT`, `VALUES`, read `PRAGMA`s (`table_info`,
-`index_list`, `user_version`, ...), `EXPLAIN`.
-
-```sh
-$ lmsql query --db app.sqlite "SELECT id, name, avatar FROM users WHERE id < 3" --max-rows 50
-{
-  "columns": [{"name": "id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, {"name": "avatar", "type": "BLOB"}],
-  "row_count": 2,
-  "rows": [[1, "ada", {"$blob_base64": "AP8Q"}], [2, "bo", null]],
-  "truncated": false,
-  "truncated_by": null
-}
+```json
+{"columns": [{"name": "...", "type": "..."}], "rows": [[...]],
+ "row_count": 0, "rows_affected": 0, "last_insert_rowid": null,
+ "truncated": false, "truncated_by": null}
 ```
 
-`type` is the declared column type (`null` for expressions). Params: `statement` (positional),
-`maxRows`, `maxBytes`, `timeoutMs`.
-
-### `exec` (write, needs `--confirm`)
-
-One statement of any kind (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `PRAGMA x = y`, ...).
-
-```sh
-$ lmsql exec --db app.sqlite "INSERT INTO users(name) VALUES ('cy') RETURNING id" --confirm
-{"last_insert_rowid": 3, "returning": {"columns": [...], "rows": [[3]], ...}, "rows_affected": 1}
-```
-
-`returning` appears when the statement produces rows (`RETURNING`, a reporting `PRAGMA`), capped
-like `query`. `--create` creates a missing database file (otherwise a missing file is
-`NOT_FOUND`).
-
-### `tables` (read)
-
-```sh
-$ lmsql tables --db app.sqlite
-{"tables": [{"name": "users", "type": "table"}, {"name": "active_users", "type": "view"}], "truncated": false}
-```
-
-### `describe` (read)
-
-```sh
-$ lmsql describe --db app.sqlite users
-{"columns": [{"cid": 0, "default": null, "name": "id", "notnull": false, "pk": 1, "type": "INTEGER"}, ...],
- "table": "users", "type": "table"}
-```
-
-The name is matched case-insensitively; `pk` is the 1-based position in the primary key (0 if
-not part of it). A missing table is `NOT_FOUND` / `TABLE_NOT_FOUND`.
-
-## Type mapping
-
-| SQLite value | JSON |
-| --- | --- |
-| NULL | `null` |
-| INTEGER | number (exact 64-bit; JavaScript clients lose precision above 2^53) |
-| REAL | number; NaN and +/-Infinity become `null` (JSON has no such numbers) |
-| TEXT (valid UTF-8) | string (NUL bytes kept, as `\u0000`) |
-| TEXT (invalid UTF-8) | `{"$text_base64": "..."}` (exact bytes) |
-| BLOB | `{"$blob_base64": "..."}` (standard alphabet, padded) |
+- **`query`** and **`exec`** both run the SQL and return that shape. They are equivalent (lmapi
+  access `dynamic`, no confirmation). Multiple statements run in order; the last statement's rows
+  are returned. `last_insert_rowid` is SQLite's rowid (`null` on PostgreSQL).
+- **`tables`** lists tables and views; `--schema` limits it (PostgreSQL schema; SQLite attached
+  database name).
+- **`describe`** returns a table's columns (name, type, notnull, default, primary-key position),
+  with an optional `--schema`.
 
 ## Connections
 
-`--db PATH` opens a SQLite file. `--connection NAME` reads the environment variable
-`LMSQL_<NAME>` (name upper-cased; letters, digits, `_`), whose value is a path, `sqlite:PATH` or
-`sqlite://PATH`. Postgres DSNs (`postgres://...`) are recognised and refused with
-`UNSUPPORTED_BACKEND` until phase 2. The value is never printed, in results or errors.
+- `--db PATH` opens a SQLite file. `--db postgres://...` connects to PostgreSQL directly.
+- `--connection NAME` reads the environment variable `LMSQL_<NAME>`, whose value is a SQLite path
+  or a `postgres://` / `postgresql://` DSN.
 
-```sh
-export LMSQL_APP=/srv/data/app.sqlite
-lmsql query --connection app "SELECT count(*) FROM users"
-```
+Prefer `LMSQL_<NAME>` for PostgreSQL: a DSN on the command line is visible to other users of the
+machine through `ps` / `/proc`. A DSN on `--db` is accepted for convenience but carries that risk.
 
-## Errors
+### TLS (PostgreSQL)
 
-| `error.code` (exit) | `data.tool_code` examples |
-| --- | --- |
-| `VALIDATION_ERROR` (2) | `SQLITE_ERROR` (syntax, unknown table/column/function; `data.offset` when known), `SQLITE_TOOBIG` (value or statement over the limits), `SQLITE_NOMEM` (over the 256 MiB heap), `TOO_MANY_STATEMENTS`, `EMPTY_STATEMENT`, `NUL_IN_STATEMENT`, `LIMIT_OUT_OF_RANGE`, `INVALID_DB_PATH`, `NOT_A_REGULAR_FILE`, `CONNECTION_REQUIRED`, `CONNECTION_CONFLICT`, `UNSUPPORTED_BACKEND` |
-| `NOT_FOUND` (4) | `SQLITE_CANTOPEN` (missing database), `TABLE_NOT_FOUND`, `CONNECTION_NOT_FOUND` |
-| `CONFLICT` (5) | `SQLITE_CONSTRAINT_UNIQUE` (and other constraints), `SQLITE_BUSY`, `SQLITE_LOCKED` |
-| `FORBIDDEN` (6) | `NOT_READ_ONLY`, `SQLITE_READONLY`, `SQLITE_AUTH` (authorizer refusals, and functions such as `load_extension()` refused inside views/triggers), `DIRECTORY_READONLY` (SQLite must create a `-wal`/`-shm` or journal file next to the database and the directory is read-only) |
-| `TIMEOUT` (7) | `TIMEOUT` |
-| `COMMAND_FAILED` (1) | `SQLITE_NOTADB`, `SQLITE_CORRUPT`, `SQLITE_IOERR`, ... |
+`sslmode` in the DSN is honored: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. The
+default is `prefer` for a local server (loopback / Unix socket) and `verify-full` for any other
+host. `sslrootcert=<pem>` supplies the trust roots (otherwise the bundled Mozilla roots). TLS uses
+rustls with the ring provider — no system TLS library.
 
-Validation of the call itself (unknown flag, wrong type, missing statement) is lmapi's
-`VALIDATION_ERROR` with `data.issues`, before the database is opened. Policy refusals are
-`MISSING_CONFIRMATION` (9) and `READONLY_VIOLATION` (6).
+## Type mapping
 
-## lmapi and the human CLI
+SQLite: NULL→`null`, INTEGER→number, REAL→number (NaN/±Inf→`null`), TEXT→string (invalid UTF-8→
+`{"$text_base64": "..."}`), BLOB→`{"$blob_base64": "..."}`.
 
-`lmsql --schema` prints the published document (also in `cli.schema.dev.json`;
-`cli.schema.latest.json` is the last released contract). The flags form *is* the human CLI:
-`lmsql query --db x "select 1"` is an lmapi invocation and prints JSON. Without an operation,
-`lmsql`, `lmsql --help` and `lmsql --version` print help and the version; there are no other
-verbs, so nothing can collide with lmapi detection.
+PostgreSQL values come back in the server's text format, typed by the column: ints/float/bool→
+number/bool, `numeric`→string (exact, incl. `"NaN"`), `json`/`jsonb`→the JSON value, `bytea`→
+`{"$blob_base64": ...}`, `timestamptz`→RFC 3339 UTC string, and everything else (text, date,
+interval, uuid, inet, arrays, enums, composites, …) as its text string. 64-bit integers are exact;
+JavaScript clients lose precision above 2^53.
+
+## Limitations
+
+- **Multi-statement PostgreSQL text** runs over the simple query protocol, which carries no column
+  types, so its values come back as strings. A single statement keeps its types.
+- **An unresponsive server**: the deadline drives `statement_timeout` and a cancel request, but if
+  a PostgreSQL server accepts the connection and then neither answers nor honors the cancel, the
+  call can block on the socket past `--timeout-ms`. A future version may add a socket read deadline.
+- **TLS verification**: `verify-ca` / `verify-full` are implemented and unit-tested, but there is
+  no integration test against a self-signed-certificate server yet.
 
 ## Build
 
 ```sh
 cargo build --release          # target/release/lmsql
-cargo test                     # unit + integration (real temp SQLite files)
+cargo test                     # SQLite + lmapi; PostgreSQL tests skip unless LMSQL_TEST_PG_URL is set
 ```
 
-MSRV: Rust 1.79 (same as lmrust).
+Running the PostgreSQL tests:
+
+```sh
+LMSQL_TEST_PG_URL="postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable" cargo test
+```
+
+MSRV: Rust 1.79.
 
 ## License
 

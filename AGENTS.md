@@ -1,29 +1,40 @@
 # lmsql development
 
-One SQL statement in, structured JSON out: a native lmapi tool (lmrust `v0.1.2`, default
-features off) over SQLite (rusqlite, bundled). Read [README.md](README.md) for the contract and
-[durable-memory/index.md](durable-memory/index.md) for decisions.
+One SQL request in, structured JSON out: a native lmapi tool (lmrust `v0.1.2`, default features
+off) over SQLite (rusqlite, bundled) and PostgreSQL (`postgres` + rustls). Read [README.md](README.md)
+for the contract and [durable-memory/index.md](durable-memory/index.md) for decisions.
 
-## Invariants
+## Open mode (v1)
 
-- **Read ops never write.** `query`/`tables`/`describe` keep all four guards in
-  `src/backend/sqlite.rs` (read-only open, `query_only`, `sqlite3_stmt_readonly`, authorizer).
-  Each guard has its own test; after changing a guard or a limit, run
-  `python3 scripts/mutation-check.py` (every mutant must fail a test; `durable-memory/safety.md`).
-- **Bounded resources.** Size limits and the heap limit in `harden`/`open`; one deadline per call
-  shared by the busy and progress handlers; `--db` must be an existing regular file.
-- **One statement per call**, found with the `sqlite3_prepare_v2` tail (`single_statement`),
-  never by splitting text.
-- **No secret echo.** Paths and connection values never reach stdout/stderr; errors go through
-  `DbError::into_cli_error` (scrubbed).
-- **No silent loss.** Caps set `truncated`/`truncated_by`; limits above a hard cap are refused.
-- **Contract files.** After changing an operation: `UPDATE_LMAPI_SCHEMA=1 cargo test --test lmapi schema_dev_file`;
-  `cli.schema.latest.json` changes only in a release and must stay an additive subset of dev.
-- **Goldens.** `UPDATE_GOLDENS=1 cargo test --test ops` only when an output change is intended.
+lmsql runs **any SQL the database accepts**. `query` and `exec` are equivalent (lmapi access
+`dynamic`, no `--confirm`); SQLite opens read-write and creates the file; PostgreSQL runs
+autocommit. There is no read-only guard, keyword allowlist, single-statement rule or
+transaction-control refusal — restrict access with the database (a read-only role; file
+permissions), not with lmsql. The earlier guard implementation is in git history (branch
+`phase2-postgres`, commit `0a3877f`) and is planned to return behind config.
+
+## Invariants (still enforced)
+
+- **Policy seam.** Every request passes through `crate::policy::Policy` (`src/policy.rs`). v1
+  allows everything and records `LMSQL_CONFIG`; put future limits here, not in the backends or the
+  op handlers.
+- **Operational caps.** `--max-rows` / `--max-bytes` stop fetching (a single row-returning
+  statement uses a cursor so a huge result does not materialize); `--timeout-ms` is one deadline
+  per call. After changing a cap, run `python3 scripts/mutation-check.py` (every mutant must fail a
+  test).
+- **No secret echo.** Database paths and DSNs (user/host/password) never reach stdout/stderr;
+  errors go through `DbError::into_cli_error`, which scrubs them. One generic `CONNECT_FAILED` for
+  every PostgreSQL connection failure.
+- **One result shape** for `query`/`exec`: `{columns, rows, row_count, rows_affected,
+  last_insert_rowid, truncated, truncated_by}`.
+- **Contract files.** After changing an operation:
+  `cargo run -- --schema > cli.schema.dev.json` (the drift test compares byte for byte); update
+  `cli.schema.latest.json` in a release.
 
 ## Checks
 
 `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-`cargo test --locked`, `cargo +1.79 test --locked` (MSRV).
+`cargo test --locked`, `cargo +1.79 test --locked` (MSRV). The PostgreSQL tests skip unless
+`LMSQL_TEST_PG_URL` is set (a throwaway server), or are required by `LMSQL_REQUIRE_PG=1` (CI).
 
-Commits: never `git add -A`; intent line, context, trailers.
+Commits: stage explicitly (never `git add -A`); intent line, context, trailers.
