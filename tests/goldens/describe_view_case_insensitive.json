@@ -1,0 +1,25 @@
+{
+  "exit": 0,
+  "stdout": {
+    "columns": [
+      {
+        "cid": 0,
+        "default": null,
+        "name": "name",
+        "notnull": false,
+        "pk": 0,
+        "type": "TEXT"
+      },
+      {
+        "cid": 1,
+        "default": null,
+        "name": "score",
+        "notnull": false,
+        "pk": 0,
+        "type": "REAL"
+      }
+    ],
+    "table": "top",
+    "type": "view"
+  }
+}

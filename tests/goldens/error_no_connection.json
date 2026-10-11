@@ -1,0 +1,13 @@
+{
+  "exit": 2,
+  "stdout": {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "data": {
+        "tool_code": "CONNECTION_REQUIRED"
+      },
+      "message": "pass db (a SQLite file) or connection (a name configured as LMSQL_<NAME>)"
+    },
+    "success": false
+  }
+}

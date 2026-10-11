@@ -1,0 +1,13 @@
+{
+  "exit": 6,
+  "stdout": {
+    "error": {
+      "code": "FORBIDDEN",
+      "data": {
+        "tool_code": "NOT_READ_ONLY"
+      },
+      "message": "query runs read-only statements only; use exec to change data"
+    },
+    "success": false
+  }
+}

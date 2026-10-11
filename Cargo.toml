@@ -1,0 +1,27 @@
+[package]
+name = "lmsql"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+authors = ["Lattice Systems LLC"]
+description = "One SQL statement in, structured JSON out: a light SQL CLI for LLMs (lmapi native tool)"
+repository = "https://github.com/lmctl-ai/lmsql"
+readme = "README.md"
+keywords = ["sql", "sqlite", "llm", "cli", "lmapi"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+# lmapi server runtime. No default features: lmsql prints sorted-key JSON (no preserve_order).
+lmrust = { git = "https://github.com/lmctl-ai/lmrust", tag = "v0.1.2", default-features = false }
+# Bundled SQLite (no system library). hooks: authorizer + progress handler (timeouts);
+# limits: SQLITE_LIMIT_ATTACHED = 0; column_decltype: declared column types in results.
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits", "column_decltype"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = "symbols"

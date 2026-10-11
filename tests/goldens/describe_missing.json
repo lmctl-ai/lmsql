@@ -1,0 +1,13 @@
+{
+  "exit": 4,
+  "stdout": {
+    "error": {
+      "code": "NOT_FOUND",
+      "data": {
+        "tool_code": "TABLE_NOT_FOUND"
+      },
+      "message": "no table or view named \"nope\""
+    },
+    "success": false
+  }
+}
