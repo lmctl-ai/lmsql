@@ -1,8 +1,10 @@
 # lmsql
 
-One SQL request in, structured JSON out. `lmsql` is a small database CLI for LLMs and the programs
-that drive them: no shell, no sessions, no prompts. Every call opens the database, runs the SQL it
-is given, prints one JSON document and exits.
+One SQL request in, structured JSON out. `lmsql` is a small, **stateless** database CLI for LLMs
+and the programs that drive them: every call is one process, one connection and one statement
+batch — no sessions, no cursors kept open, no pagination tokens, nothing remembered between calls.
+A small result comes back inline; a big one is written in full to a file and the response says
+where it is.
 
 It is a native [lmapi](https://github.com/lmctl-ai/lmapi) tool (`cli.schema.v1`), built on the Rust
 SDK [lmrust](https://github.com/lmctl-ai/lmrust): `lmsql --schema` publishes the contract, and an
@@ -44,38 +46,116 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO lmsql_ro;
 ALTER ROLE lmsql_ro SET default_transaction_read_only = on;
 ```
 
-## What is still enforced: operational caps
+## Big results go to a file
 
-These bound the *result and the time*, not what SQL may do (they protect the LLM's context and the
-process, not the database):
+lmsql never truncates a result and never pages it. If it is small, the rows come back inline. If
+it is big, **the full result is written to a file** and the response is a summary with a short
+preview; the caller then reads or processes the file with its own tools.
 
-| Cap | Default | Meaning |
-| --- | --- | --- |
-| `--max-rows` | 200 | stop fetching after this many rows; `truncated: true`, `truncated_by: "max_rows"`. A single row-returning statement is read through a cursor (SQLite) or a server cursor (PostgreSQL), so a 5-million-row `SELECT` stops in milliseconds without materializing. |
-| `--max-bytes` | 1 MiB | stop when the serialized rows reach this size (`truncated_by: "max_bytes"`). |
-| `--timeout-ms` | 10 s | one deadline for the call: SQLite busy-wait + a progress handler that interrupts a long statement (`TIMEOUT`, exit 7); PostgreSQL `statement_timeout`/`lock_timeout`/`connect_timeout` plus a watchdog that sends a cancel request at the deadline. |
+```sh
+# Explicit: stream everything to a file (format from the extension, or --out-format).
+lmsql query --connection prod "SELECT * FROM events" --out /work/events.ndjson
+lmsql query --db app.sqlite "SELECT * FROM users" --out users.csv
+
+# Automatic: past --max-rows / --max-bytes the result spills to $LMSQL_OUT_DIR.
+lmsql query --db app.sqlite "SELECT * FROM log"
+```
+
+A file response (both cases):
+
+```json
+{"columns": [{"name": "id", "type": "INTEGER"}, {"name": "msg", "type": "TEXT"}],
+ "row_count": 5000000, "rows_affected": 0, "last_insert_rowid": 0,
+ "file": {"path": "/tmp/lmsql/lmsql-20261011T160537Z-59b5c9e9.ndjson",
+          "format": "ndjson", "bytes": 157777792, "rows": 5000000},
+ "preview": [[1, "boot"], [2, "ready"]],
+ "spilled": true, "overwrote": false, "truncated": false, "truncated_by": null}
+```
+
+How an LLM caller should follow up (the file is plain text; `row_count` is the exact number of
+rows, already counted):
+
+```sh
+head -n 5 /tmp/lmsql/lmsql-...ndjson                     # look at a few rows
+jq -c 'select(.status == "error")' file.ndjson | head    # filter (ndjson: one object per line)
+jq -r '.msg' file.ndjson | sort | uniq -c | sort -rn     # aggregate
+wc -l file.ndjson                                        # = rows (ndjson)
+```
+
+Often the better follow-up is a narrower query (`WHERE`, `GROUP BY`, `LIMIT`) — the database is
+faster at it than a file scan.
+
+**`out` given** — every row is streamed to that file and the response is the summary above
+(`spilled: false`, `overwrote` says whether a file was replaced). `--out-format` is `ndjson`,
+`csv` or `json`; by default it comes from the extension (`.csv`, `.json`, `.ndjson`/`.jsonl`),
+else ndjson. A relative path is relative to the working directory; the response always has the
+absolute path. Missing parent directories are created. The path is checked (a probe file is
+created and removed) **before the SQL runs**, so an unwritable `out` (`OUT_NOT_WRITABLE`) never
+follows a committed write. The preview is the first `--max-rows` rows if given, else 20 (and never
+more than `--max-bytes`).
+
+**`out` not given** — rows stay inline (`rows`) while the result is within `--max-rows`
+(default 200) **and** `--max-bytes` (default 1 MiB, the exact size of the serialized `rows`
+array). The first row past either threshold switches the call to a spill: the full result goes to
+`$LMSQL_OUT_DIR/lmsql-<UTC yyyymmddThhmmssZ>-<random>.ndjson` (default directory
+`<system temp>/lmsql/`, created mode 0700; as it sits in a shared directory it must be a real
+directory owned by you and closed to others, else `OUT_NOT_WRITABLE`) and the response is the
+summary with `spilled: true`. So `--max-rows` / `--max-bytes` are the *inline thresholds* now
+(the flag names are kept for compatibility); `truncated` is a legacy field and always `false`.
+
+**Writing safely** — rows are written as they are fetched, never all held in memory: 5 million
+rows stream at about 5 MiB peak memory (SQLite ~5 s, PostgreSQL ~9 s, debug build). Each file is
+written to a new temporary name in the target directory (mode 0600) and renamed into place only
+when the call succeeds; on any error (SQL error mid-stream, timeout, disk) the temporary file is
+removed and an existing target is left untouched. An existing `out` file is replaced.
+
+**Cleanup is the caller's job** — lmsql never deletes old spill files (it remembers nothing
+between calls). Delete them when done, or point `LMSQL_OUT_DIR` at a directory you clean. There is
+no disk-space cap yet (a planned `Policy` setting).
+
+### File formats
+
+Values follow the same type rules as inline rows (see *Type mapping*): BLOB / `bytea` →
+`{"$blob_base64": "..."}`, PostgreSQL `numeric` → string, `json`/`jsonb` → the JSON value,
+non-finite reals → `null`, NULL → `null`.
+
+| Format | Shape |
+| --- | --- |
+| `ndjson` | one JSON object per line, keyed by column name (`{"id":1,"name":"ada"}`); a duplicate column name gets `_2`, `_3`, … |
+| `json` | one JSON array of the same objects, written incrementally (`[` … `]`; an empty result is `[\n]`) |
+| `csv` | RFC 4180: a header row of the (de-duplicated) column names, CRLF line ends, a field quoted when it contains `,` `"` CR or LF (quotes doubled). **NULL is an empty field; an empty string is `""`**, so they stay distinct. Numbers and booleans as JSON text; objects (blobs, json) as compact JSON text. A statement without columns writes an empty file. |
+
+## Time limit
+
+`--timeout-ms` (default 10 s, at most 300 s) is one deadline for the call: SQLite busy-wait plus
+a progress handler that interrupts a long statement (`TIMEOUT`, exit 7); PostgreSQL
+`statement_timeout` / `lock_timeout` / `connect_timeout` plus a watchdog that sends a cancel
+request at the deadline. It includes the time spent writing a file.
 
 Errors are lmapi envelopes on stdout (`{"success": false, "error": {"code", "message", "data":
 {"tool_code", ...}}}`) with the backend's code in `tool_code` (`SQLITE_*`, `PG_<SQLSTATE>`, or
-`TIMEOUT` / `CONNECT_FAILED`). A database path or DSN (user, host, password) never appears in a
-result or an error message.
+`TIMEOUT` / `CONNECT_FAILED` / `OUT_NOT_WRITABLE`). A database path or DSN (user, host, password)
+never appears in a result or an error message.
 
 ## Operations
 
 All take the database as `--db` or `--connection NAME`, and accept the `--input-json` /
-`--input-file` forms of lmapi. Every result has one shape:
+`--input-file` forms of lmapi. An inline result:
 
 ```json
 {"columns": [{"name": "...", "type": "..."}], "rows": [[...]],
  "row_count": 0, "rows_affected": 0, "last_insert_rowid": null,
- "truncated": false, "truncated_by": null}
+ "spilled": false, "truncated": false, "truncated_by": null}
 ```
 
-- **`query`** and **`exec`** both run the SQL and return that shape. They are equivalent (lmapi
-  access `dynamic`, no confirmation). Multiple statements run in order; the last statement's rows
-  are returned. `last_insert_rowid` is SQLite's rowid (`null` on PostgreSQL).
+and a file result replaces `rows` with `file`, `preview` and `overwrote` (see above).
+
+- **`query`** and **`exec`** both run the SQL and return that shape (params `out`, `outFormat`,
+  `maxRows`, `maxBytes`, `timeoutMs`). They are equivalent (lmapi access `dynamic`, no
+  confirmation). Multiple statements run in order; the last statement's rows are returned.
+  `last_insert_rowid` is SQLite's rowid (`null` on PostgreSQL).
 - **`tables`** lists tables and views; `--schema` limits it (PostgreSQL schema; SQLite attached
-  database name).
+  database name); `--max-rows` caps the list (`truncated: true` past it).
 - **`describe`** returns a table's columns (name, type, notnull, default, primary-key position),
   with an optional `--schema`.
 
@@ -109,7 +189,13 @@ JavaScript clients lose precision above 2^53.
 ## Limitations
 
 - **Multi-statement PostgreSQL text** runs over the simple query protocol, which carries no column
-  types, so its values come back as strings. A single statement keeps its types.
+  types, so its values come back as strings. A single statement keeps its types. The driver also
+  returns a simple-protocol response as a whole, so a *huge* result from multi-statement text or
+  `INSERT ... RETURNING` is held in memory once before it is written; a single `SELECT` streams
+  through a cursor with bounded memory.
+- **Side effects before a spill error**: `out` is checked before the SQL runs, but a spill (or a
+  full disk) can still fail after a PostgreSQL autocommit statement has committed.
+- **No disk-space cap** and **no cleanup** of spill files (see *Big results go to a file*).
 - **An unresponsive server**: the deadline drives `statement_timeout` and a cancel request, but if
   a PostgreSQL server accepts the connection and then neither answers nor honors the cancel, the
   call can block on the socket past `--timeout-ms`. A future version may add a socket read deadline.
