@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Mutation check of lmsql's open-mode operational caps (the protections that remain in v1 after
-the SQL guards were removed): apply each mutation alone, run `cargo test --no-fail-fast`, restore
-the file. Every mutation must make at least one test fail (exit 1 lists survivors).
+"""Mutation check of lmsql's open-mode invariants: big results go to a file (spill, atomic write,
+private permissions, out checked before the SQL runs, bounded memory), the timeout, and secret
+scrubbing. Apply each mutation alone, run `cargo test --no-fail-fast`, restore the file. Every
+mutation must make at least one test fail (exit 1 lists survivors).
 
 The PostgreSQL mutant is only exercised when LMSQL_TEST_PG_URL is set (otherwise the pg tests skip
 and it survives); set it (and keep a throwaway server up) to check that one too.
@@ -13,27 +14,44 @@ os.chdir(pathlib.Path(__file__).resolve().parent.parent)
 S = 'src/backend/sqlite.rs'
 P = 'src/backend/postgres/ops.rs'
 E = 'src/error.rs'
+O = 'src/output.rs'
 
 mutations = [
-  # SQLite --max-rows cap removed: the fetch would not stop at the cap.
-  ("OM1 sqlite row cap removed", S,
-   "    if rows.len() == limits.max_rows {",
-   "    if false {"),
+  # A result past the inline threshold stays inline instead of spilling to a file.
+  ("OM1 spill disabled", O,
+   "    if self.inline.len() < self.config.inline_rows",
+   "    if true || self.inline.len() < self.config.inline_rows"),
   # SQLite --timeout-ms disabled: a runaway statement is never interrupted.
   ("OM2 sqlite timeout handler disabled", S,
    "Some(move || Instant::now() >= deadline)",
    "Some(move || { let _ = deadline; false })"),
-  # PostgreSQL cursor cap ignored: a huge SELECT keeps fetching instead of stopping at the cap.
-  ("OM3 pg cursor cap ignored", P,
-   "        if !sink.push(&texts) {\n          return Ok(());\n        }",
-   "        {\n          let _ = sink.push(&texts);\n        }"),
+  # A failed call leaves its partial temporary file behind.
+  ("OM3 temp file kept on error", O,
+   "      let _ = std::fs::remove_file(temp);",
+   "      let _ = temp;"),
   # Secret scrubbing disabled: a database path / DSN leaks into an error message.
   ("OM4 scrubber disabled", E,
    'result.push_str(if whole { "<db>" } else { secret });',
    "result.push_str(secret);"),
+  # The shared default spill directory is used even when others can write to it.
+  ("OM5 spill dir privacy check removed", O,
+   "    if meta.uid() != me || meta.mode() & 0o077 != 0 {",
+   "    if false && (meta.uid() != me || meta.mode() & 0o077 != 0) {"),
+  # out is not checked before the SQL runs: a write commits, then the file fails.
+  ("OM6 out preflight removed", O,
+   "        preflight(&path)?;",
+   "        let _ = &path;"),
+  # Result files readable by everyone.
+  ("OM7 file mode not 0600", O,
+   "    options.mode(0o600);",
+   "    options.mode(0o644);"),
+  # PostgreSQL fetches the whole result at once (memory grows with the result).
+  ("OM8 pg cursor fetches everything at once", P,
+   'format!("FETCH FORWARD {batch} FROM {CURSOR}")',
+   'format!("FETCH ALL FROM {CURSOR}")'),
 ]
 
-files = {S, P, E}
+files = {S, P, E, O}
 originals = {f: pathlib.Path(f).read_text() for f in files}
 for name, f, a, b in mutations:
   assert originals[f].count(a) == 1, (name, originals[f].count(a))
