@@ -195,7 +195,7 @@ fn create_temp(dir: &Path, name: &str) -> Result<(PathBuf, File), DbError> {
   }
   let file = options
     .open(&temp)
-    .map_err(|e| io_error("create a file in", dir, &e))?;
+    .map_err(|e| io_error("create", &dir.join(name), &e))?;
   Ok((temp, file))
 }
 
@@ -516,12 +516,13 @@ pub enum Collected {
   },
 }
 
-/// Serialized size of a row inside the inline `rows` array (with its separator).
-fn row_size(values: &[Value]) -> usize {
+/// Serialized size of a row, plus the `,` before it unless it is the first: with the 2 bytes of
+/// `[]`, the running total is exactly the length of the serialized `rows` / `preview` array.
+fn row_size(values: &[Value], first: bool) -> usize {
   serde_json::to_string(values)
     .map(|s| s.len())
     .unwrap_or(usize::MAX / 2)
-    + 1
+    + usize::from(!first)
 }
 
 impl Sink {
@@ -559,7 +560,7 @@ impl Sink {
     if self.preview.len() >= self.config.preview_rows {
       return;
     }
-    let size = row_size(&values);
+    let size = row_size(&values, self.preview.is_empty());
     if self.preview_bytes + size <= self.config.inline_bytes {
       self.preview_bytes += size;
       self.preview.push(values);
@@ -577,7 +578,7 @@ impl Sink {
       self.keep_preview(values);
       return Ok(());
     }
-    let size = row_size(&values);
+    let size = row_size(&values, self.inline.is_empty());
     if self.inline.len() < self.config.inline_rows
       && self.inline_bytes + size <= self.config.inline_bytes
     {

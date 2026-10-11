@@ -44,6 +44,19 @@ pub fn bin() -> PathBuf {
 
 /// Run lmsql; kills it and panics after `limit`.
 pub fn run_with(args: &[&str], env: &[(&str, &str)], limit: Duration) -> Out {
+  run_full(args, env, None, limit).0
+}
+
+/// Run lmsql in `cwd` (default: inherited) and also return its peak resident set size in KiB
+/// (from `wait4`'s rusage, for this child only). Kills it and panics after `limit`.
+// The child is reaped by `libc::wait4` (which also yields its rusage), not by `Child::wait`.
+#[allow(clippy::zombie_processes)]
+pub fn run_full(
+  args: &[&str],
+  env: &[(&str, &str)],
+  cwd: Option<&Path>,
+  limit: Duration,
+) -> (Out, u64) {
   let mut cmd = Command::new(bin());
   cmd
     .args(args)
@@ -55,8 +68,12 @@ pub fn run_with(args: &[&str], env: &[(&str, &str)], limit: Duration) -> Out {
   for (k, v) in env {
     cmd.env(k, v);
   }
+  if let Some(dir) = cwd {
+    cmd.current_dir(dir);
+  }
   let start = Instant::now();
   let mut child = cmd.spawn().expect("spawn lmsql");
+  let pid = child.id() as libc::pid_t;
   let mut so = child.stdout.take().unwrap();
   let mut se = child.stderr.take().unwrap();
   let t1 = std::thread::spawn(move || {
@@ -69,23 +86,37 @@ pub fn run_with(args: &[&str], env: &[(&str, &str)], limit: Duration) -> Out {
     let _ = se.read_to_end(&mut v);
     v
   });
-  let status = loop {
-    if let Some(s) = child.try_wait().unwrap() {
-      break s;
+  // Reap the child ourselves with wait4 to read its own rusage (std's Child is never waited).
+  let mut status: libc::c_int = 0;
+  // SAFETY: zeroed rusage is a valid value of this plain C struct.
+  let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+  loop {
+    // SAFETY: valid pointers to locals; pid is our own child.
+    let r = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut usage) };
+    if r == pid {
+      break;
     }
+    assert!(r == 0, "wait4 failed");
     if start.elapsed() > limit {
       let _ = child.kill();
-      let _ = child.wait();
+      // SAFETY: as above; blocking reap of the killed child.
+      unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
       panic!("lmsql {args:?} did not finish within {limit:?}");
     }
     std::thread::sleep(Duration::from_millis(5));
-  };
-  Out {
-    code: status.code().expect("exit code"),
+  }
+  assert!(
+    libc::WIFEXITED(status),
+    "lmsql {args:?} was killed by a signal"
+  );
+  let out = Out {
+    code: libc::WEXITSTATUS(status),
     stdout: t1.join().unwrap(),
     stderr: String::from_utf8_lossy(&t2.join().unwrap()).into_owned(),
     elapsed: start.elapsed(),
-  }
+  };
+  // ru_maxrss is in KiB on Linux (bytes on macOS).
+  (out, usage.ru_maxrss as u64)
 }
 
 pub fn run(args: &[&str]) -> Out {
