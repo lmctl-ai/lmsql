@@ -1,10 +1,12 @@
 //! The published lmapi operations (`query`, `exec`, `tables`, `describe`) and their handlers.
 
-use crate::backend::{Backend, Target};
+use crate::backend::Backend;
 use crate::connection;
+use crate::connection::Intent;
 use crate::error::DbError;
 use crate::output::{Format, OutputConfig, Sink, DEFAULT_PREVIEW_ROWS};
 use crate::policy::Policy as OpenPolicy;
+use crate::settings::{Level, Settings};
 use crate::values::{
   Limits, DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_MS, HARD_MAX_BYTES, HARD_MAX_ROWS,
   HARD_TIMEOUT_MS,
@@ -168,12 +170,6 @@ fn number(params: &Record, name: &str) -> Option<f64> {
   params.get(name).and_then(Value::as_f64)
 }
 
-fn target(params: &Record) -> Result<Target, DbError> {
-  connection::resolve(text(params, "db"), text(params, "connection"), |k| {
-    std::env::var(k).ok()
-  })
-}
-
 fn limits(params: &Record) -> Result<Limits, DbError> {
   Limits::new(
     number(params, "maxRows"),
@@ -182,17 +178,37 @@ fn limits(params: &Record) -> Result<Limits, DbError> {
   )
 }
 
-/// Run `f` against the resolved backend; errors and results never carry the path or DSN.
+fn env(name: &str) -> Option<String> {
+  std::env::var(name).ok()
+}
+
+/// Run `f` against the resolved backend under the settings file (if any); errors and results
+/// never carry a path or DSN. `intent` describes the call for a permission denial.
 fn with_backend(
   params: &Record,
+  intent: Intent<'_>,
   f: impl FnOnce(&dyn Backend, &Limits) -> Result<Value, DbError>,
 ) -> Result<Value, CliError> {
-  let target = target(params).map_err(|e| e.into_cli_error(&[]))?;
-  let secrets = target.secrets();
+  let settings = Settings::load(&env, &mut |warning| eprintln!("{warning}"))
+    .map_err(|e| e.into_cli_error(&[]))?;
+  let mut secrets = settings.secrets(&env);
+  let (target, access) = connection::resolve_with(
+    text(params, "db"),
+    text(params, "connection"),
+    &settings,
+    env,
+  )
+  .map_err(|e| e.into_cli_error(&secrets))?;
+  secrets.extend(target.secrets());
+  if access.level == Level::None {
+    return Err(access.denied(intent).into_cli_error(&secrets));
+  }
   let limits = limits(params).map_err(|e| e.into_cli_error(&secrets))?;
-  let backend = target.backend();
+  let backend = target.backend(access.level == Level::ReadOnly);
   // Results carry user data only (rows, names, counts); error messages are scrubbed.
-  f(backend.as_ref(), &limits).map_err(|e| e.into_cli_error(&secrets))
+  f(backend.as_ref(), &limits)
+    .map_err(|e| access.map_error(e, intent))
+    .map_err(|e| e.into_cli_error(&secrets))
 }
 
 fn statement(params: &Record) -> &str {
@@ -203,7 +219,7 @@ fn statement(params: &Record) -> &str {
 /// (which allows everything in v1) and run it, returning one shape.
 fn run_sql(op: &str, params: &Record) -> Result<Value, CliError> {
   let sql = statement(params).to_string();
-  with_backend(params, |b, l| {
+  with_backend(params, Intent::Sql(statement(params)), |b, l| {
     OpenPolicy::load().allow(op, &sql)?;
     // Checked before the SQL runs: a bad out path must not follow a committed write.
     let config = OutputConfig::new(
@@ -256,7 +272,7 @@ pub fn spec() -> CliSpec<Policy> {
         Access::Read,
         op("tables").description.unwrap_or_default(),
         |params, _| {
-          with_backend(params, |b, l| {
+          with_backend(params, Intent::Tables, |b, l| {
             let (tables, truncated) = b.tables(text(params, "schema"), l)?;
             Ok(json!({
               "tables": tables.iter().map(|t| t.to_json()).collect::<Vec<_>>(),
@@ -274,7 +290,7 @@ pub fn spec() -> CliSpec<Policy> {
         op("describe").description.unwrap_or_default(),
         |params, _| {
           let table = text(params, "table").unwrap_or_default();
-          with_backend(params, |b, l| {
+          with_backend(params, Intent::Describe(table), |b, l| {
             b.describe(text(params, "schema"), table, l)
               .map(|d| d.to_json())
           })

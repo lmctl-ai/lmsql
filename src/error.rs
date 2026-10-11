@@ -14,6 +14,9 @@ pub struct DbError {
   /// The message comes from SQLite/rusqlite and may quote the database path; lmsql's own
   /// messages never do and are not scrubbed (a short path such as `not` must not garble them).
   pub foreign: bool,
+  /// For a permission denial: the equivalent command the operator can run in their own shell
+  /// (`error.data.manual_command`). Never holds a secret value.
+  pub manual_command: Option<String>,
 }
 
 impl DbError {
@@ -24,6 +27,7 @@ impl DbError {
       message: message.into(),
       offset: None,
       foreign: false,
+      manual_command: None,
     }
   }
 
@@ -48,6 +52,9 @@ impl DbError {
     let mut err = CliError::new(self.code, message).tool_code(self.tool_code);
     if let Some(offset) = self.offset {
       err = err.with("offset", offset.into());
+    }
+    if let Some(command) = self.manual_command {
+      err = err.with("manual_command", command.into());
     }
     err
   }

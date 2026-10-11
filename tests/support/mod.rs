@@ -64,7 +64,10 @@ pub fn run_full(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .env_remove("LMSQL_READONLY")
-    .env_remove("LMSQL_DRYRUN");
+    .env_remove("LMSQL_DRYRUN")
+    // Hermetic: never the developer's own ~/.config/lmsql/settings.json (tests that need a
+    // settings file pass LMSQL_CONFIG themselves).
+    .env("LMSQL_CONFIG", "/nonexistent/lmsql-test/settings.json");
   for (k, v) in env {
     cmd.env(k, v);
   }
