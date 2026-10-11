@@ -172,7 +172,8 @@ fn last_result(
     rows: Vec::new(),
     truncated_by: None,
   });
-  let affected = if rows.rows.is_empty() { affected } else { 0 };
+  // `affected` is the last statement's command tag: the row count for INSERT/UPDATE/DELETE
+  // (including RETURNING), or the selected count for a trailing SELECT in multi-statement text.
   (rows, affected)
 }
 
