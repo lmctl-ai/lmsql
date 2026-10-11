@@ -70,7 +70,9 @@ fn sqlite_dry_run_reads_run_and_changes_are_only_described() {
       assert_eq!(doc["rows"], json!([[1], [2], [3]]));
     } else {
       assert_eq!(doc["statement"], *sql);
+      // The plan is a best-effort extra: an array when SQLite gives one, else absent.
       assert_eq!(doc["plan"].is_array(), *has_plan, "{sql}: {doc}");
+      assert_eq!(doc.get("plan").is_some(), *has_plan, "{sql}: {doc}");
     }
   }
   // Multi-statement text with one write: nothing runs, each statement is described.
@@ -263,6 +265,27 @@ fn pg_dry_run() {
   }
   let doc = pg_run(&url, &["query", &delete, "--dry-run"]).json();
   assert_eq!(doc["estimated_rows"], 100.0, "{doc}");
+  // Not a read by its first keyword: never sent, so a statement that would fail if it ran is
+  // still a successful dry run; the estimate fails quietly and is simply absent.
+  for sql in [
+    "DELETE FROM lmsql_no_such_table",
+    "/* comment */ DROP TABLE lmsql_no_such_table",
+    "VACUUM lmsql_no_such_table",
+  ] {
+    let out = pg_run(&url, &["query", sql, "--dry-run"]);
+    assert_eq!(out.code, 0, "{sql}: {}", out.text());
+    let doc = out.json();
+    assert_eq!(
+      keys(&doc),
+      (json!(true), json!(false), json!(true)),
+      "{sql}: {doc}"
+    );
+    assert_eq!(doc["statement"], sql);
+    assert!(
+      doc.get("plan").is_none() && doc.get("estimated_rows").is_none(),
+      "{doc}"
+    );
+  }
   assert_eq!(count(), 1000, "a dry run changed the table");
   let exists: bool = pg_admin(&url)
     .query_one(

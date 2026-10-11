@@ -144,12 +144,12 @@ impl Postgres {
   /// The plan of one statement, best effort: `EXPLAIN (FORMAT JSON)` without ANALYZE plans and
   /// never executes, and the extended protocol accepts exactly one statement. `null` when the
   /// text cannot be explained (DDL, multi-statement text).
-  fn plan(&self, sql: &str, limits: &Limits) -> (Value, Option<f64>) {
+  fn plan(&self, sql: &str, limits: &Limits) -> (Option<Value>, Option<f64>) {
     let Ok(mut session) = connect(&self.dsn, limits) else {
-      return (Value::Null, None);
+      return (None, None);
     };
     if session.apply_settings(true).is_err() {
-      return (Value::Null, None);
+      return (None, None);
     }
     let explained = session
       .client
@@ -170,11 +170,52 @@ impl Postgres {
         let rows = node["Plan Rows"]
           .as_f64()
           .or_else(|| top["Plan Rows"].as_f64());
-        (plan, rows)
+        (Some(plan), rows)
       }
-      None => (Value::Null, None),
+      None => (None, None),
     }
   }
+}
+
+/// The first word of `sql` after whitespace, comments (`--`, nested `/* */`) and opening
+/// parentheses, lower-cased (empty when there is none).
+fn first_keyword(sql: &str) -> String {
+  let b = sql.as_bytes();
+  let mut i = 0;
+  loop {
+    while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'(') {
+      i += 1;
+    }
+    if b[i..].starts_with(b"--") {
+      match b[i..].iter().position(|&c| c == b'\n') {
+        Some(n) => i += n + 1,
+        None => return String::new(),
+      }
+    } else if b[i..].starts_with(b"/*") {
+      let mut depth = 0usize;
+      while i < b.len() {
+        if b[i..].starts_with(b"/*") {
+          depth += 1;
+          i += 2;
+        } else if b[i..].starts_with(b"*/") {
+          depth -= 1;
+          i += 2;
+          if depth == 0 {
+            break;
+          }
+        } else {
+          i += 1;
+        }
+      }
+    } else {
+      break;
+    }
+  }
+  b[i..]
+    .iter()
+    .take_while(|c| c.is_ascii_alphabetic())
+    .map(|c| c.to_ascii_lowercase() as char)
+    .collect()
 }
 
 fn relkind(kind: &str) -> &'static str {
@@ -234,24 +275,44 @@ impl Backend for Postgres {
     }
   }
 
-  /// Reads run as usual, in a session whose every transaction is READ ONLY; a statement the
-  /// server refuses there (SQLSTATE 25006) would change something and is reported with its plan.
+  /// A guardrail heuristic for honest mistakes, not a parser: only text whose first keyword is a
+  /// read (SELECT, WITH, VALUES, TABLE, SHOW) is sent at all, and then in a session whose every
+  /// transaction is READ ONLY; a statement the server still refuses as a write (SQLSTATE 25006)
+  /// is reported, not run. Everything else is reported as a change without being sent. The plan
+  /// is a best-effort extra.
   fn dry_run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<DryRun, DbError> {
+    let keyword = first_keyword(sql);
+    // EXPLAIN without ANALYZE plans and never executes; only tried for plain DML.
+    let plannable = matches!(
+      keyword.as_str(),
+      "insert" | "update" | "delete" | "merge" | "with"
+    );
+    let would_change = || {
+      let (plan, estimated_rows) = if plannable {
+        self.plan(sql, limits)
+      } else {
+        (None, None)
+      };
+      Ok(DryRun::WouldChange(vec![Planned {
+        statement: sql.to_string(),
+        would_change: true,
+        plan,
+        estimated_rows,
+      }]))
+    };
+    if !matches!(
+      keyword.as_str(),
+      "select" | "with" | "values" | "table" | "show"
+    ) {
+      return would_change();
+    }
     let read_only = Postgres {
       dsn: self.dsn.clone(),
       read_only: true,
     };
     match read_only.run(sql, limits, sink) {
       Ok(stats) => Ok(DryRun::Read(stats)),
-      Err(e) if e.tool_code == "PG_25006" => {
-        let (plan, estimated_rows) = self.plan(sql, limits);
-        Ok(DryRun::WouldChange(vec![Planned {
-          statement: sql.to_string(),
-          would_change: true,
-          plan,
-          estimated_rows,
-        }]))
-      }
+      Err(e) if e.tool_code == "PG_25006" => would_change(),
       Err(e) => Err(e),
     }
   }
@@ -372,5 +433,29 @@ impl Backend for Postgres {
       kind: relkind(found.get(3)).to_string(),
       columns,
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::first_keyword;
+
+  #[test]
+  fn first_keyword_skips_whitespace_comments_and_parentheses() {
+    for (sql, kw) in [
+      ("SELECT 1", "select"),
+      ("  \n\twith x as (select 1) select * from x", "with"),
+      ("-- note\nDELETE FROM t", "delete"),
+      ("/* a /* nested */ b */ (( VALUES (1)))", "values"),
+      ("Show search_path", "show"),
+      ("insert into t values (1)", "insert"),
+      ("-- only a comment", ""),
+      ("", ""),
+      ("/* unterminated", ""),
+      ("1 + 1", ""),
+      ("\u{2603} select", ""),
+    ] {
+      assert_eq!(first_keyword(sql), kw, "{sql:?}");
+    }
   }
 }

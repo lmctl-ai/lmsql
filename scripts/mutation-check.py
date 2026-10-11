@@ -89,6 +89,10 @@ mutations = [
   ("PS8 sqlite dry run executes writes", S,
    "    if !statements.iter().any(|(_, write)| *write) {",
    "    if true {"),
+  # The PostgreSQL dry-run keyword gate lets non-read statements through to the server.
+  ("PS10 pg dry-run keyword gate widened", P,
+   '''      "select" | "with" | "values" | "table" | "show"''',
+   '''      "select" | "with" | "values" | "table" | "show" | "delete" | "drop" | "vacuum"'''),
   # A PostgreSQL dry run runs the text in a read-write session.
   ("PS9 pg dry run not read-only", P,
    "      read_only: true,",

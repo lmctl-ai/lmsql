@@ -62,7 +62,10 @@ pub enum DryRun {
 pub struct Planned {
   pub statement: String,
   pub would_change: bool,
-  pub plan: Value,
+  /// Best effort, may be absent: the database's own plan (`EXPLAIN` without ANALYZE / `EXPLAIN
+  /// QUERY PLAN`; nothing executes). Any failure just leaves it out.
+  pub plan: Option<Value>,
+  /// Best effort, may be absent: the planner's row estimate (PostgreSQL).
   pub estimated_rows: Option<f64>,
 }
 
