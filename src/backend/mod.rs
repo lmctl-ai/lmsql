@@ -76,26 +76,32 @@ impl Rows {
   }
 }
 
-/// What `exec` changed. `returning` holds rows of a statement that produces them
-/// (`INSERT ... RETURNING`, a `PRAGMA` that reports).
+/// The result of running one request (`query` and `exec` are identical in open mode): the last
+/// statement's columns and rows (capped), plus how many rows it changed. One shape for both ops.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ExecOutcome {
+pub struct RunOutcome {
+  pub rows: Rows,
   pub rows_affected: u64,
-  /// SQLite's last rowid; `None` (JSON `null`) for PostgreSQL, which has none (use RETURNING).
+  /// SQLite's last inserted rowid; `None` (JSON `null`) for PostgreSQL, which has none.
   pub last_insert_rowid: Option<i64>,
-  pub returning: Option<Rows>,
 }
 
-impl ExecOutcome {
+impl RunOutcome {
   pub fn to_json(&self) -> Value {
-    let mut out = json!({
+    json!({
+      "columns": self
+        .rows
+        .columns
+        .iter()
+        .map(|c| json!({"name": c.name, "type": c.decl_type}))
+        .collect::<Vec<_>>(),
+      "rows": self.rows.rows,
+      "row_count": self.rows.rows.len(),
       "rows_affected": self.rows_affected,
       "last_insert_rowid": self.last_insert_rowid,
-    });
-    if let Some(rows) = &self.returning {
-      out["returning"] = rows.to_json();
-    }
-    out
+      "truncated": self.rows.truncated_by.is_some(),
+      "truncated_by": self.rows.truncated_by,
+    })
   }
 }
 
@@ -160,13 +166,13 @@ impl TableDescription {
   }
 }
 
-/// The operations every backend provides. Read operations must be impossible to turn into
-/// writes; `exec` is the only write path.
+/// The operations every backend provides. In open mode a backend runs any SQL the database
+/// accepts (the earlier read-only guards are in git history on `phase2-postgres` / at 0a3877f);
+/// result size and time are still capped by [`Limits`].
 pub trait Backend {
-  /// One read-only statement.
-  fn query(&self, sql: &str, limits: &Limits) -> Result<Rows, DbError>;
-  /// One statement of any kind. `create` allows creating a missing database.
-  fn exec(&self, sql: &str, limits: &Limits, create: bool) -> Result<ExecOutcome, DbError>;
+  /// Run the request's SQL and return the last statement's columns/rows plus rows changed.
+  /// `query` and `exec` both call this; they differ only in lmapi access level.
+  fn run(&self, sql: &str, limits: &Limits) -> Result<RunOutcome, DbError>;
   /// Tables and views (internal objects excluded), capped by `limits.max_rows`; `schema` limits
   /// the list to one schema.
   fn tables(

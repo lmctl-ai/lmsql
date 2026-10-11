@@ -43,14 +43,11 @@ pub fn resolve(
           "db is empty",
         ));
       }
+      // A postgres:// DSN on --db is accepted (open mode favours simplicity). Note that argv
+      // is visible to other users via ps / /proc, so LMSQL_<NAME> + --connection keeps a DSN
+      // with a password out of the process table; the README says so.
       if crate::backend::postgres::dsn::is_postgres_dsn(path) {
-        // argv is visible to every user of the machine (ps, /proc): no credentials there.
-        return Err(DbError::new(
-          ErrorCode::ValidationError,
-          "DSN_ON_COMMAND_LINE",
-          "PostgreSQL DSNs are not accepted on the command line (other users can read argv); \
-           put the DSN in LMSQL_<NAME> and pass connection NAME",
-        ));
+        return Ok(Target::Postgres(path.trim().to_string()));
       }
       Ok(Target::Sqlite(PathBuf::from(path)))
     }
@@ -171,9 +168,11 @@ mod tests {
       resolve(None, Some("pg"), &e).unwrap(),
       Target::Postgres("postgres://user:secret@host/db".into())
     );
-    let err = resolve(Some("postgresql://user:secret@host/db"), None, &e).unwrap_err();
-    assert_eq!(err.tool_code, "DSN_ON_COMMAND_LINE");
-    assert!(!err.message.contains("secret"));
+    // A DSN on --db is accepted directly in open mode.
+    assert_eq!(
+      resolve(Some("postgresql://user:secret@host/db"), None, &e).unwrap(),
+      Target::Postgres("postgresql://user:secret@host/db".into())
+    );
     for (name, code) in [
       ("odd", "UNSUPPORTED_BACKEND"),
       ("blank", "CONNECTION_NOT_FOUND"),

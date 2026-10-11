@@ -1,21 +1,13 @@
-//! PostgreSQL backend (sync `postgres` driver, rustls TLS).
+//! PostgreSQL backend (sync `postgres` driver, rustls TLS), open mode.
 //!
-//! PostgreSQL has no per-statement read-only flag, so `query`/`tables`/`describe` are protected by
-//! layers, each tested on its own (`durable-memory/postgres.md`):
-//!
-//! 1. **Statement rules** ([`classify`]): exactly one statement, balanced parentheses, and for
-//!    `query` an allowlist of read statements, no write keywords, no side-effect functions.
-//! 2. **A READ ONLY transaction**, locked in by a first query before the user's statement (so a
-//!    later `SET TRANSACTION READ WRITE` is refused), always rolled back.
-//! 3. **The server's own checks**: the extended protocol refuses a second statement, `DECLARE
-//!    CURSOR` accepts only SELECT/VALUES, and the role's privileges (a read-only role is the real
-//!    safeguard; README).
-//!
-//! Time: one deadline per call. `connect_timeout`, `statement_timeout`, `lock_timeout` and
-//! `idle_in_transaction_session_timeout` come from the remaining time, and a watchdog thread
-//! sends the server a cancel request when the deadline passes.
+//! lmsql runs whatever SQL it is given over an autocommit session: no keyword allowlist, no
+//! READ ONLY transaction, no transaction-control refusal. A read-only database role is the way to
+//! restrict what a connection can do; the earlier in-tool guards are in git history (branch
+//! `phase2-postgres`). Still enforced as operational caps: `max_rows`/`max_bytes` (a single
+//! row-returning statement is read through a cursor so a huge result stops fast) and one deadline
+//! per call (`connect_timeout`, `statement_timeout`, `lock_timeout`, plus a watchdog that sends
+//! the server a cancel request when the deadline passes).
 
-pub mod classify;
 pub mod dsn;
 pub mod errors;
 pub mod tls;
@@ -25,7 +17,7 @@ mod ops;
 
 use crate::error::DbError;
 use crate::values::Limits;
-use postgres::{Client, NoTls, Transaction};
+use postgres::{Client, NoTls};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -38,21 +30,6 @@ impl Postgres {
   pub fn new(dsn: String) -> Self {
     Postgres { dsn }
   }
-}
-
-/// Which layers run. Production always uses [`Guards::ALL`]; tests switch one off to show which
-/// layer stops an attack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Guards {
-  pub statement_rules: bool,
-  pub read_only_txn: bool,
-}
-
-impl Guards {
-  pub const ALL: Guards = Guards {
-    statement_rules: true,
-    read_only_txn: true,
-  };
 }
 
 /// A connected session with its deadline; dropping it stops the watchdog.
@@ -75,7 +52,7 @@ impl Session {
     Instant::now() >= self.deadline
   }
 
-  /// Map a driver error from this session.
+  /// Map a driver error from this session (after connecting).
   pub fn err(&self, error: postgres::Error) -> DbError {
     errors::from_pg(error, false, self.deadline_passed())
   }
@@ -87,6 +64,23 @@ impl Session {
       .saturating_duration_since(Instant::now())
       .as_millis()
       .max(1)
+  }
+
+  /// Pin the session's timeouts (from the remaining time) and output formats so values parse the
+  /// same on every server. Session-level `SET` (not `SET LOCAL`): the process runs one call.
+  pub fn apply_settings(&mut self) -> Result<(), DbError> {
+    let ms = self.remaining_ms();
+    let setup = format!(
+      "SET statement_timeout = {ms}; SET lock_timeout = {ms}; \
+       SET idle_in_transaction_session_timeout = {ms}; \
+       SET TimeZone = 'UTC'; SET DateStyle = 'ISO, YMD'; SET IntervalStyle = 'iso_8601'; \
+       SET bytea_output = 'hex'; SET extra_float_digits = '3'"
+    );
+    let passed = self.deadline_passed();
+    self
+      .client
+      .batch_execute(&setup)
+      .map_err(|e| errors::from_pg(e, false, passed))
   }
 }
 
@@ -128,41 +122,4 @@ fn start_watchdog(
     }
   });
   done
-}
-
-/// Start the call's transaction. Read calls are READ ONLY (unless a test switches layer 2 off);
-/// the settings query right after BEGIN is the transaction's first query, so its read-only mode
-/// can no longer be changed. Timeouts come from the remaining time; output formats are pinned so
-/// values parse the same on every server.
-pub fn begin<'a>(
-  session: &'a mut Session,
-  read: bool,
-  guards: Guards,
-) -> Result<Transaction<'a>, DbError> {
-  let read_only = read && guards.read_only_txn;
-  let ms = session.remaining_ms();
-  let deadline_passed = session.deadline_passed();
-  let mut tx = session
-    .client
-    .build_transaction()
-    .read_only(read_only)
-    .start()
-    .map_err(|e| errors::from_pg(e, false, deadline_passed))?;
-  let mut setup = String::new();
-  if read_only {
-    setup.push_str("SET TRANSACTION READ ONLY; ");
-  }
-  setup.push_str(&format!(
-    "SELECT pg_catalog.set_config('statement_timeout', '{ms}', true), \
-     pg_catalog.set_config('lock_timeout', '{ms}', true), \
-     pg_catalog.set_config('idle_in_transaction_session_timeout', '{ms}', true), \
-     pg_catalog.set_config('TimeZone', 'UTC', true), \
-     pg_catalog.set_config('DateStyle', 'ISO, YMD', true), \
-     pg_catalog.set_config('IntervalStyle', 'iso_8601', true), \
-     pg_catalog.set_config('bytea_output', 'hex', true), \
-     pg_catalog.set_config('extra_float_digits', '3', true)"
-  ));
-  tx.batch_execute(&setup)
-    .map_err(|e| errors::from_pg(e, false, deadline_passed))?;
-  Ok(tx)
 }
