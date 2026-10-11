@@ -17,9 +17,11 @@ Permission settings, slice 1.
 - `--help` text updated (it still described the 0.1 confirm/read-only model).
 - SQLite per-table levels (`permissions.tables`) through the SQLite authorizer: `readonly` tables
   refuse writes/DDL, `none` tables refuse any access and are hidden from `tables`.
-- Dry run (lmrust's `--dry-run` / `LMSQL_DRYRUN`): reads run normally; anything that would change
-  something is not executed and is described (`executed: false, would_change: true`, the
-  database's plan, PostgreSQL `estimated_rows`); no file is written (`would_write`).
+- Dry run (lmrust's `--dry-run` / `LMSQL_DRYRUN`) prints information only: reads run normally;
+  anything that would change something is never executed and is reported as `{dry_run, executed:
+  false, would_change: true, statement}` (SQLite: `sqlite3_stmt_readonly`; PostgreSQL: only
+  SELECT/WITH/VALUES/TABLE/SHOW are sent, in a READ ONLY session). `plan` / `estimated_rows` are
+  best-effort extras that may be absent. No file is written (`would_write`).
 - `--dangerously-bypass-permission-settings` on all operations, effective only with
   `"allow_bypass": true` (else `BYPASS_NOT_ALLOWED`); skips the permission rules, not the limits.
 - `output.dir` containment for `out` and spills (canonical paths; `PERMISSION_DENIED` outside).

@@ -99,21 +99,25 @@ connections exist and how much lmsql may do with each. The file is `$LMSQL_CONFI
   a `readonly` table refuses writes and DDL on it, a `none` table refuses any access, and is
   hidden from `tables` and refused by `describe`. Unlisted tables follow the default. Names
   compare case-insensitively. For PostgreSQL a `tables` block is rejected: use grants and roles.
-- **Dry run** — lmapi's `--dry-run` (or `LMSQL_DRYRUN=1`) estimates the blast radius and changes
-  nothing. Reads run normally (`dry_run: true, executed: true, would_change: false`). If the SQL
-  would change anything, **nothing is executed**; the response is `{"dry_run": true, "executed":
-  false, "would_change": true, "statement": "...", "plan": ...}`:
-  - SQLite asks `sqlite3_stmt_readonly` for every statement (preparing runs nothing); `plan` is
-    the `EXPLAIN QUERY PLAN` lines (null where SQLite has none, e.g. DDL); multi-statement text
-    lists each statement with its own `would_change` and plan, and none of them runs.
-  - PostgreSQL runs the text in a session where every transaction is READ ONLY; a statement the
-    server refuses there (SQLSTATE 25006) would change something. `plan` is `EXPLAIN (FORMAT
-    JSON)` (no ANALYZE, so nothing executes; null for DDL or multi-statement text) and
-    `estimated_rows` is the planner's estimate of the rows the write would touch.
+- **Dry run** — lmapi's `--dry-run` (or `LMSQL_DRYRUN=1`) **prints information only**: anything
+  that would change data is never sent to be executed. Reads run normally and return the normal
+  result plus `dry_run: true, executed: true, would_change: false`. Otherwise the response is
+  `{"dry_run": true, "executed": false, "would_change": true, "statement": "<the SQL as given>"}`
+  (exit 0) — showing the statement is how you estimate.
+  - SQLite prepares every statement (preparing runs nothing) and asks `sqlite3_stmt_readonly`; a
+    write is never stepped. Multi-statement text lists each statement with its own
+    `would_change`, and if any would change something, none runs.
+  - PostgreSQL sends a statement only if its first keyword (after whitespace and comments) is
+    SELECT, WITH, VALUES, TABLE or SHOW; everything else is reported as a change without being
+    sent. A statement that passes runs in a session where every transaction is READ ONLY, and if
+    the server still refuses it as a write (SQLSTATE 25006) it is reported as a change. This is a
+    guardrail heuristic for honest mistakes, not a SQL parser; functions called by a read still
+    run.
+  - **Best effort, may be absent:** `plan` (the database's own `EXPLAIN (FORMAT JSON)` /
+    `EXPLAIN QUERY PLAN`, never ANALYZE, so nothing executes) and `estimated_rows` (PostgreSQL's
+    estimate of the rows a write would touch). Any failure simply leaves them out.
   - No file is written: `file: null` with `would_write: {path, format}` when `out` was given, or
     a note when the result would have spilled. Permissions still apply (denied stays denied).
-  - It is an estimate: on PostgreSQL the read-only session refuses writes such as `nextval`, but
-    functions a read calls still run.
 - **Bypass** — `--dangerously-bypass-permission-settings` skips the permission rules for one call
   (connection levels, table rules, the direct-access gate, `output.dir`) but not the operational
   limits (`--timeout-ms`, inline thresholds), and prints one line on stderr. It only works when

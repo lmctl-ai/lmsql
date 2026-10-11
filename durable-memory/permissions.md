@@ -36,21 +36,25 @@ run; psql/sqlite3 are not on that list, so only the operator uses them (hence `m
   differs from the default; the handle is read-only only when no table allows writes; the
   connection is refused outright only when nothing allows access (`TableRules::max`). Denials
   name the table and the key. `tables` hides `none` tables; `describe` refuses them up front.
-- **Dry run** (owner's definition: estimate the blast radius, change nothing; no
-  execute-then-roll-back): reuses lmrust's dryrun global. SQLite: `sqlite3_stmt_readonly` on every
-  prepared statement; any write => none is stepped. PostgreSQL: no classifier — the text runs in a
-  READ ONLY session; SQLSTATE 25006 => would change; plan via `EXPLAIN (FORMAT JSON)` on the
-  extended protocol (one statement, no ANALYZE); `estimated_rows` from the ModifyTable's input
-  node (the ModifyTable itself always estimates 0). No out/spill file. A write that the
-  connection level forbids stays a denial.
+- **Dry run** (owner's final definition: print information only; a write never goes to the
+  database; showing the statement is how the user estimates, the tool's estimate is optional):
+  reuses lmrust's dryrun global. Required fields `{dry_run, executed: false, would_change: true,
+  statement}`. SQLite: `sqlite3_stmt_readonly` on every prepared statement; any write => none is
+  stepped. PostgreSQL: a first-keyword gate (`first_keyword`, comments/whitespace/parentheses
+  skipped) sends only SELECT/WITH/VALUES/TABLE/SHOW, in a READ ONLY session; 25006 => would
+  change. Extras `plan` / `estimated_rows` only when EXPLAIN (no ANALYZE) succeeds — absent on any
+  failure, never failing the dry run; for PostgreSQL tried only for INSERT/UPDATE/DELETE/MERGE/
+  WITH, and `estimated_rows` comes from the ModifyTable's input node. No out/spill file. A write
+  that the connection level forbids stays a denial. (An earlier execute-and-roll-back design was
+  dropped.)
 - **Bypass**: a per-op boolean param (flag `--dangerously-bypass-permission-settings`), gated by
   `allow_bypass` in the operator's file because the LLM can see and pass the flag. Skips
   levels, table rules, the direct gate and output.dir; not the limits; one stderr line.
 - **output.dir**: resolved at load (`~/`, relative to the settings file). `contain()` compares
   canonical paths (dangling symlinks followed too; a `..` in the not-yet-existing tail is refused).
   Spills go there. The slice-1 warning is gone.
-- Mutation check: PS1–PS9 (fail closed x2, connection gate, table authorizer, direct gate, bypass
-  gate, containment, dry run x2).
+- Mutation check: PS1–PS10 (fail closed x2, connection gate, table authorizer, direct gate,
+  bypass gate, containment, dry run x3 incl. the keyword gate).
 
 ## Later slices (not started)
 
