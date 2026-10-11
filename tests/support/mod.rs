@@ -127,3 +127,69 @@ pub fn snapshot(path: &Path) -> Vec<u8> {
 pub fn s(path: &Path) -> String {
   path.display().to_string()
 }
+
+/// The superuser URL of the test PostgreSQL server (`LMSQL_TEST_PG_URL`). Without it the
+/// Postgres tests skip with a message, unless `LMSQL_REQUIRE_PG=1` (CI), which makes a missing
+/// server a failure.
+pub fn pg_url() -> Option<String> {
+  match std::env::var("LMSQL_TEST_PG_URL") {
+    Ok(url) if !url.trim().is_empty() => Some(url),
+    _ => {
+      if std::env::var("LMSQL_REQUIRE_PG").as_deref() == Ok("1") {
+        panic!("LMSQL_REQUIRE_PG=1 but LMSQL_TEST_PG_URL is not set");
+      }
+      eprintln!("SKIPPED: set LMSQL_TEST_PG_URL to run the PostgreSQL tests");
+      None
+    }
+  }
+}
+
+/// A direct superuser client for test setup.
+pub fn pg_admin(url: &str) -> postgres::Client {
+  postgres::Client::connect(url, postgres::NoTls).expect("connect to the test server")
+}
+
+/// `url` with another user and password (`postgres://user:pw@rest`).
+pub fn pg_url_as(url: &str, user: &str, password: &str) -> String {
+  let (scheme, rest) = url.split_once("://").unwrap();
+  let rest = rest.rsplit_once('@').map(|(_, r)| r).unwrap_or(rest);
+  format!("{scheme}://{user}:{password}@{rest}")
+}
+
+/// A fresh schema (and its name) for one test; dropped on drop.
+pub struct PgSchema {
+  pub url: String,
+  pub name: String,
+}
+
+impl PgSchema {
+  pub fn new(url: &str, label: &str) -> PgSchema {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("lmsql_{label}_{}_{n}", std::process::id());
+    pg_admin(url)
+      .batch_execute(&format!(
+        "DROP SCHEMA IF EXISTS {name} CASCADE; CREATE SCHEMA {name}"
+      ))
+      .unwrap();
+    PgSchema {
+      url: url.to_string(),
+      name,
+    }
+  }
+}
+
+impl Drop for PgSchema {
+  fn drop(&mut self) {
+    if let Ok(mut c) = postgres::Client::connect(&self.url, postgres::NoTls) {
+      let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.name));
+    }
+  }
+}
+
+/// Run lmsql with `LMSQL_PG` set to `dsn` (`--connection pg`).
+pub fn pg_run(dsn: &str, args: &[&str]) -> Out {
+  let mut full = vec![args[0], "--connection", "pg"];
+  full.extend(&args[1..]);
+  run_with(&full, &[("LMSQL_PG", dsn)], Duration::from_secs(30))
+}
