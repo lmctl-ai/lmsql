@@ -1,81 +1,27 @@
 //! The operations on PostgreSQL, open mode: run any SQL over an autocommit session.
 //!
-//! A single row-returning statement is read through a cursor so a huge result stops at the cap
-//! without materializing. Anything else (writes, DDL, `RETURNING`, utility statements, or
-//! multi-statement text) runs over the simple query protocol; its last statement's rows are
-//! returned, capped. Values come back in PostgreSQL's text format and are typed by the column's
-//! type where lmsql knows it (always on the cursor path; by the prepared statement on the
-//! RETURNING fallback; by name only for free-form multi-statement text).
+//! A single row-returning statement is read through a server cursor in batches and streamed into
+//! the [`Sink`] (inline, or a file for a big result), so even millions of rows use bounded memory.
+//! Anything else (writes, DDL, `RETURNING`, utility statements, multi-statement text) runs over the
+//! simple query protocol; the driver returns that response as a whole, so a big result from such
+//! text is held in memory once before it is written (documented). Values come back in
+//! PostgreSQL's text format and are typed by the column's type where lmsql knows it (always on the
+//! cursor path; by the prepared statement on the RETURNING fallback; not for free-form
+//! multi-statement text, whose values are strings).
 
-use super::values::{min_json_len, to_json};
+use super::values::to_json;
 use super::{connect, Postgres};
-use crate::backend::{Backend, Column, ColumnInfo, Rows, RunOutcome, TableDescription, TableEntry};
+use crate::backend::{Backend, Column, ColumnInfo, RunStats, TableDescription, TableEntry};
 use crate::error::DbError;
+use crate::output::Sink;
 use crate::values::Limits;
 use postgres::{SimpleQueryMessage, Transaction};
 use serde_json::Value;
 
 const CURSOR: &str = "lmsql_cursor";
 
-/// Cursor batches grow from 8 rows to this: a cap is overshot by at most one batch.
-const MAX_BATCH: usize = 256;
-
-/// Collects text rows under the caps; `push` returns false when the caller should stop.
-struct Sink<'l> {
-  types: Vec<String>,
-  rows: Vec<Vec<Value>>,
-  bytes: usize,
-  limits: &'l Limits,
-  truncated_by: Option<&'static str>,
-}
-
-impl<'l> Sink<'l> {
-  fn new(types: Vec<String>, limits: &'l Limits) -> Self {
-    Sink {
-      types,
-      rows: Vec::new(),
-      bytes: 2,
-      limits,
-      truncated_by: None,
-    }
-  }
-
-  fn push(&mut self, texts: &[Option<&str>]) -> bool {
-    if self.rows.len() == self.limits.max_rows {
-      self.truncated_by = Some("max_rows");
-      return false;
-    }
-    let width = texts.len();
-    let mut lower = 2 + width.saturating_sub(1);
-    for (i, t) in texts.iter().enumerate() {
-      lower += min_json_len(self.type_at(i), *t);
-    }
-    if self.bytes + lower + 1 > self.limits.max_bytes {
-      self.truncated_by = Some("max_bytes");
-      return false;
-    }
-    let values: Vec<Value> = texts
-      .iter()
-      .enumerate()
-      .map(|(i, t)| to_json(self.type_at(i), *t))
-      .collect();
-    let size = serde_json::to_string(&values)
-      .map(|s| s.len())
-      .unwrap_or(usize::MAX)
-      + 1;
-    if self.bytes + size > self.limits.max_bytes {
-      self.truncated_by = Some("max_bytes");
-      return false;
-    }
-    self.bytes += size;
-    self.rows.push(values);
-    true
-  }
-
-  fn type_at(&self, i: usize) -> &str {
-    self.types.get(i).map(String::as_str).unwrap_or("text")
-  }
-}
+/// Cursor batches grow from 64 rows to this.
+const MAX_BATCH: usize = 2048;
 
 fn columns(stmt: &postgres::Statement) -> (Vec<Column>, Vec<String>) {
   let cols = stmt
@@ -94,19 +40,35 @@ fn columns(stmt: &postgres::Statement) -> (Vec<Column>, Vec<String>) {
   (cols, types)
 }
 
-/// Read a cursor in growing batches over the simple protocol (text values).
-fn fetch_cursor(tx: &mut Transaction<'_>, sink: &mut Sink<'_>) -> Result<(), postgres::Error> {
-  let mut batch = 8usize;
+/// One text row typed by `types` (missing types read as text).
+fn typed(row: &postgres::SimpleQueryRow, types: &[String]) -> Vec<Value> {
+  (0..row.len())
+    .map(|i| {
+      to_json(
+        types.get(i).map(String::as_str).unwrap_or("text"),
+        row.get(i),
+      )
+    })
+    .collect()
+}
+
+/// Read the declared cursor to the end in growing batches (text values), row by row.
+fn fetch_cursor(
+  tx: &mut Transaction<'_>,
+  types: &[String],
+  sink: &mut Sink,
+  err: &dyn Fn(postgres::Error) -> DbError,
+) -> Result<(), DbError> {
+  let mut batch = 64usize;
   loop {
-    let messages = tx.simple_query(&format!("FETCH FORWARD {batch} FROM {CURSOR}"))?;
+    let messages = tx
+      .simple_query(&format!("FETCH FORWARD {batch} FROM {CURSOR}"))
+      .map_err(err)?;
     let mut got = 0;
-    for message in &messages {
+    for message in messages {
       if let SimpleQueryMessage::Row(row) = message {
         got += 1;
-        let texts: Vec<Option<&str>> = (0..row.len()).map(|i| row.get(i)).collect();
-        if !sink.push(&texts) {
-          return Ok(());
-        }
+        sink.row(typed(&row, types))?;
       }
     }
     if got < batch {
@@ -116,65 +78,49 @@ fn fetch_cursor(tx: &mut Transaction<'_>, sink: &mut Sink<'_>) -> Result<(), pos
   }
 }
 
-/// The last statement's rows and the last command tag, from a simple-query batch. `types` is the
-/// prepared column types when known (the single-RETURNING fallback); otherwise types come by name.
-fn last_result(
-  messages: &[SimpleQueryMessage],
-  types: Option<&[String]>,
-  limits: &Limits,
-) -> (Rows, u64) {
-  let mut best: Option<Rows> = None;
-  let mut cur_cols: Vec<Column> = Vec::new();
-  let mut sink: Option<Sink> = None;
+/// Feed a simple-query response to the sink: each statement with rows is a new result set, each
+/// without rows an empty one. Returns the last command tag count. `types` types the columns when
+/// they are known (the single-statement RETURNING fallback).
+fn feed(
+  messages: Vec<SimpleQueryMessage>,
+  types: Option<(&[Column], &[String])>,
+  sink: &mut Sink,
+) -> Result<u64, DbError> {
   let mut affected = 0u64;
+  let mut described = false;
+  let mut current: Vec<String> = Vec::new();
   for message in messages {
     match message {
       SimpleQueryMessage::RowDescription(desc) => {
-        cur_cols = desc
-          .iter()
-          .map(|c| Column {
-            name: c.name().to_string(),
-            decl_type: None,
-          })
-          .collect();
-        let cur_types: Vec<String> = match types {
-          Some(t) => t.to_vec(),
-          None => vec!["text".to_string(); desc.len()],
+        described = true;
+        let (cols, tys) = match types {
+          Some((cols, tys)) if cols.len() == desc.len() => (cols.to_vec(), tys.to_vec()),
+          _ => (
+            desc
+              .iter()
+              .map(|c| Column {
+                name: c.name().to_string(),
+                decl_type: None,
+              })
+              .collect(),
+            vec!["text".to_string(); desc.len()],
+          ),
         };
-        if let Some(t) = types {
-          for (col, name) in cur_cols.iter_mut().zip(t) {
-            col.decl_type = Some(name.clone());
-          }
-        }
-        sink = Some(Sink::new(cur_types, limits));
+        current = tys;
+        sink.begin(cols)?;
       }
-      SimpleQueryMessage::Row(row) => {
-        if let Some(s) = sink.as_mut() {
-          let texts: Vec<Option<&str>> = (0..row.len()).map(|i| row.get(i)).collect();
-          s.push(&texts);
-        }
-      }
+      SimpleQueryMessage::Row(row) => sink.row(typed(&row, &current))?,
       SimpleQueryMessage::CommandComplete(n) => {
-        affected = *n;
-        if let Some(s) = sink.take() {
-          best = Some(Rows {
-            columns: cur_cols.clone(),
-            rows: s.rows,
-            truncated_by: s.truncated_by,
-          });
+        affected = n;
+        if !described {
+          sink.begin(Vec::new())?;
         }
+        described = false;
       }
       _ => {}
     }
   }
-  let rows = best.unwrap_or(Rows {
-    columns: Vec::new(),
-    rows: Vec::new(),
-    truncated_by: None,
-  });
-  // `affected` is the last statement's command tag: the row count for INSERT/UPDATE/DELETE
-  // (including RETURNING), or the selected count for a trailing SELECT in multi-statement text.
-  (rows, affected)
+  Ok(affected)
 }
 
 fn relkind(kind: &str) -> &'static str {
@@ -187,75 +133,49 @@ fn relkind(kind: &str) -> &'static str {
 }
 
 impl Backend for Postgres {
-  fn run(&self, sql: &str, limits: &Limits) -> Result<RunOutcome, DbError> {
+  fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError> {
     let mut session = connect(&self.dsn, limits)?;
     session.apply_settings()?;
     let deadline = session.deadline;
-    let err =
-      |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);
+    let err = move |e: postgres::Error| {
+      super::errors::from_pg(e, false, std::time::Instant::now() >= deadline)
+    };
+    let stats = |rows_affected| RunStats {
+      rows_affected,
+      last_insert_rowid: None,
+    };
 
     // One statement the extended protocol accepts: prepare tells us its columns and types.
     match session.client.prepare(sql) {
       Ok(stmt) if stmt.columns().is_empty() => {
         let affected = session.client.execute(&stmt, &[]).map_err(err)?;
-        Ok(RunOutcome {
-          rows: Rows {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            truncated_by: None,
-          },
-          rows_affected: affected,
-          last_insert_rowid: None,
-        })
+        sink.begin(Vec::new())?;
+        Ok(stats(affected))
       }
       Ok(stmt) => {
         let (cols, types) = columns(&stmt);
-        // Try a cursor so a huge result stops at the cap; a data-modifying statement
-        // (INSERT ... RETURNING, WITH ... INSERT) cannot be a cursor, so fall back.
+        // A cursor streams a huge result; a data-modifying statement (INSERT ... RETURNING,
+        // WITH ... INSERT) cannot be a cursor, so it falls back to the simple protocol.
         let mut tx = session.client.transaction().map_err(err)?;
         let declared = tx.batch_execute(&format!(
           "DECLARE {CURSOR} NO SCROLL CURSOR WITHOUT HOLD FOR {sql}"
         ));
-        match declared {
-          Ok(()) => {
-            let mut sink = Sink::new(types, limits);
-            let fetch = fetch_cursor(&mut tx, &mut sink);
-            let _ = tx.rollback();
-            fetch.map_err(err)?;
-            Ok(RunOutcome {
-              rows: Rows {
-                columns: cols,
-                rows: sink.rows,
-                truncated_by: sink.truncated_by,
-              },
-              rows_affected: 0,
-              last_insert_rowid: None,
-            })
-          }
-          Err(_) => {
-            let _ = tx.rollback();
-            // RETURNING or a data-modifying CTE: run it once, typed by the prepared columns.
-            let messages = session.client.simple_query(sql).map_err(err)?;
-            let (mut rows, affected) = last_result(&messages, Some(&types), limits);
-            rows.columns = cols;
-            Ok(RunOutcome {
-              rows,
-              rows_affected: affected,
-              last_insert_rowid: None,
-            })
-          }
+        if declared.is_ok() {
+          sink.begin(cols)?;
+          let fetched = fetch_cursor(&mut tx, &types, sink, &err);
+          let _ = tx.rollback();
+          fetched?;
+          return Ok(stats(0));
         }
+        let _ = tx.rollback();
+        let messages = session.client.simple_query(sql).map_err(err)?;
+        Ok(stats(feed(messages, Some((&cols, &types)), sink)?))
       }
       // Multi-statement text or a utility statement the extended protocol rejects: run the whole
       // text over the simple protocol (autocommit, unless the text has its own BEGIN/COMMIT).
       Err(_) => {
         let messages = session.client.simple_query(sql).map_err(err)?;
-        let (rows, affected) = last_result(&messages, None, limits);
-        Ok(RunOutcome {
-          rows,
-          rows_affected: affected,
-          last_insert_rowid: None,
-        })
+        Ok(stats(feed(messages, None, sink)?))
       }
     }
   }

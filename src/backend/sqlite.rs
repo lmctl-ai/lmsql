@@ -5,16 +5,17 @@
 //! rows are returned) — with no read-only guard, authorizer, pragma or ATTACH restriction. The
 //! earlier guards are in git history (branch `phase2-postgres`, commit 0a3877f).
 //!
-//! Still enforced, as operational caps (they bound the result, not what SQL may do): `max_rows`
-//! and `max_bytes` stop fetching rows, and `timeout` is the busy-wait limit and a progress-handler
-//! deadline that interrupts a long statement.
+//! Rows are stepped one at a time into the [`Sink`] (inline, or streamed to a file for a big
+//! result; never all in memory). `timeout` is the busy-wait limit and a progress-handler deadline
+//! that interrupts a long statement.
 //!
 //! A `file:` name is made a literal path (the bundled SQLite is built with `SQLITE_USE_URI`), so a
 //! name is never reinterpreted as a URI with its own parameters.
 
-use super::{Backend, Column, ColumnInfo, Rows, RunOutcome, TableDescription, TableEntry};
+use super::{Backend, Column, ColumnInfo, RunStats, TableDescription, TableEntry};
 use crate::error::DbError;
-use crate::values::{min_json_len, to_json, Limits};
+use crate::output::Sink;
+use crate::values::{to_json, Limits};
 use rusqlite::{Batch, Connection, OpenFlags, Statement};
 use serde_json::Value;
 use std::cell::Cell;
@@ -90,78 +91,41 @@ fn columns_of(stmt: &Statement<'_>) -> Vec<Column> {
     .collect()
 }
 
-/// Step `stmt` to the end or until a cap: an extra row is read before reporting `max_rows`, so
-/// `truncated` is true only when rows were really left out.
-pub fn collect_rows(stmt: &mut Statement<'_>, limits: &Limits) -> Result<Rows, DbError> {
+/// Step `stmt` to the end, handing each row to the sink.
+fn stream_rows(stmt: &mut Statement<'_>, sink: &mut Sink) -> Result<(), DbError> {
   let columns = columns_of(stmt);
   let width = columns.len();
-  let mut rows: Vec<Vec<Value>> = Vec::new();
-  let mut bytes = 2; // "[]"
-  let mut truncated_by = None;
+  sink.begin(columns)?;
   let mut cursor = stmt.query([])?;
   while let Some(row) = cursor.next()? {
-    if rows.len() == limits.max_rows {
-      truncated_by = Some("max_rows");
-      break;
-    }
-    let mut lower_bound = 2 + width.saturating_sub(1);
-    for i in 0..width {
-      lower_bound += min_json_len(row.get_ref(i)?);
-    }
-    if bytes + lower_bound + 1 > limits.max_bytes {
-      truncated_by = Some("max_bytes");
-      break;
-    }
     let values: Vec<Value> = (0..width)
       .map(|i| row.get_ref(i).map(to_json))
       .collect::<Result<_, _>>()?;
-    let size = serde_json::to_string(&values)
-      .map(|s| s.len())
-      .unwrap_or(usize::MAX)
-      + 1;
-    if bytes + size > limits.max_bytes {
-      truncated_by = Some("max_bytes");
-      break;
-    }
-    bytes += size;
-    rows.push(values);
+    sink.row(values)?;
   }
-  Ok(Rows {
-    columns,
-    rows,
-    truncated_by,
-  })
+  Ok(())
 }
 
-/// Run every statement in `sql`; return the last statement's rows (empty if it returns none).
-fn run_batch(conn: &Connection, sql: &str, limits: &Limits) -> Result<Rows, DbError> {
-  let mut last = Rows {
-    columns: Vec::new(),
-    rows: Vec::new(),
-    truncated_by: None,
-  };
+/// Run every statement in `sql`; each one with rows starts a new result set in the sink, each one
+/// without rows an empty one, so the call ends with the last statement's rows.
+fn run_batch(conn: &Connection, sql: &str, sink: &mut Sink) -> Result<(), DbError> {
   let mut batch = Batch::new(conn, sql);
   while let Some(mut stmt) = batch.next()? {
     if stmt.column_count() > 0 {
-      last = collect_rows(&mut stmt, limits)?;
+      stream_rows(&mut stmt, sink)?;
     } else {
       stmt.raw_execute()?;
-      last = Rows {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        truncated_by: None,
-      };
+      sink.begin(Vec::new())?;
     }
   }
-  Ok(last)
+  Ok(())
 }
 
 impl Backend for Sqlite {
-  fn run(&self, sql: &str, limits: &Limits) -> Result<RunOutcome, DbError> {
+  fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError> {
     let conn = open(&self.path, limits)?;
-    let rows = run_batch(&conn, sql, limits)?;
-    Ok(RunOutcome {
-      rows,
+    run_batch(&conn, sql, sink)?;
+    Ok(RunStats {
       rows_affected: conn.changes(),
       last_insert_rowid: Some(conn.last_insert_rowid()),
     })
@@ -255,6 +219,8 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::output::{Collected, OutputConfig};
+  use serde_json::json;
 
   fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -268,55 +234,71 @@ mod tests {
     (dir, path)
   }
 
+  fn run(db: &Sqlite, sql: &str, inline_rows: usize) -> (Collected, RunStats) {
+    let mut sink = Sink::new(OutputConfig::new(None, None, inline_rows, 1 << 20, false).unwrap());
+    let stats = db.run(sql, &Limits::default(), &mut sink).unwrap();
+    (sink.finish().unwrap(), stats)
+  }
+
+  fn inline_rows(c: Collected) -> Vec<Vec<Value>> {
+    match c {
+      Collected::Inline { rows, .. } => rows,
+      other => panic!("expected inline rows, got {other:?}"),
+    }
+  }
+
   #[test]
   fn open_mode_runs_any_statement_including_writes_and_multi_statement() {
     let (_d, path) = temp_db();
-    let db = Sqlite::new(path.clone());
-    let limits = Limits::default();
-    // A write through the same entry point as a read.
-    let out = db
-      .run("INSERT INTO t(v) VALUES ('b'), ('c')", &limits)
-      .unwrap();
-    assert_eq!(out.rows_affected, 2);
-    // Multi-statement text: the last statement's rows come back.
-    let out = db
-      .run(
-        "UPDATE t SET v = 'x' WHERE id = 1; SELECT id, v FROM t ORDER BY id",
-        &limits,
-      )
-      .unwrap();
-    assert_eq!(out.rows.rows.len(), 3);
-    assert_eq!(
-      out.rows.rows[0],
-      vec![serde_json::json!(1), serde_json::json!("x")]
+    let db = Sqlite::new(path);
+    let (_, stats) = run(&db, "INSERT INTO t(v) VALUES ('b'), ('c')", 200);
+    assert_eq!(stats.rows_affected, 2);
+    let (rows, _) = run(
+      &db,
+      "UPDATE t SET v = 'x' WHERE id = 1; SELECT id, v FROM t ORDER BY id",
+      200,
     );
-    // A read returns rows; last_insert_rowid is present for SQLite.
-    let out = db.run("SELECT count(*) FROM t", &limits).unwrap();
-    assert_eq!(out.rows.rows, vec![vec![serde_json::json!(3)]]);
-    assert!(out.last_insert_rowid.is_some());
+    let rows = inline_rows(rows);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![json!(1), json!("x")]);
+    // A trailing statement without rows leaves an empty result.
+    let (rows, stats) = run(&db, "SELECT * FROM t; DELETE FROM t WHERE id = 3", 200);
+    assert!(inline_rows(rows).is_empty());
+    assert_eq!(stats.rows_affected, 1);
   }
 
   #[test]
   fn missing_file_is_created() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("new.db");
-    let db = Sqlite::new(path.clone());
-    db.run("CREATE TABLE a(x)", &Limits::default()).unwrap();
+    run(&Sqlite::new(path.clone()), "CREATE TABLE a(x)", 200);
     assert!(path.exists());
   }
 
   #[test]
-  fn row_cap_still_applies() {
+  fn past_the_inline_threshold_the_result_spills_to_a_file() {
     let (_d, path) = temp_db();
-    let db = Sqlite::new(path);
-    let limits = Limits {
-      max_rows: 2,
-      ..Limits::default()
-    };
+    let out = tempfile::tempdir().unwrap();
+    std::env::set_var(crate::output::OUT_DIR_ENV, out.path());
     let sql =
-      "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 1000) SELECT x FROM c";
-    let out = db.run(sql, &limits).unwrap();
-    assert_eq!(out.rows.rows.len(), 2);
-    assert_eq!(out.rows.truncated_by, Some("max_rows"));
+      "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 50) SELECT x FROM c";
+    let (c, _) = run(&Sqlite::new(path), sql, 10);
+    let Collected::File {
+      row_count,
+      file,
+      spilled,
+      preview,
+      ..
+    } = c
+    else {
+      panic!("no spill");
+    };
+    assert!(spilled);
+    assert_eq!((row_count, file.rows), (50, 50));
+    assert_eq!(preview.len(), 10);
+    assert_eq!(
+      std::fs::read_to_string(&file.path).unwrap().lines().count(),
+      50
+    );
   }
 }

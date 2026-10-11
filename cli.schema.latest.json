@@ -116,13 +116,13 @@
           "name": "statement",
           "type": "string",
           "positional": true,
-          "description": "Exactly one SQL statement (any SQL; multiple statements run in order and the last one's rows are returned)"
+          "description": "SQL to run (any SQL; multiple statements run in order and the last one's rows are returned)"
         },
         {
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
+          "description": "Path of a SQLite database file, or a postgres:// DSN (prefer connection for DSNs: argv is visible to other users)"
         },
         {
           "name": "connection",
@@ -134,15 +134,31 @@
           "name": "maxRows",
           "type": "number",
           "occurs": "?",
-          "default": 200,
-          "description": "Return at most this many rows (1..10000); more set truncated: true"
+          "description": "Inline threshold (1..10000, default 200): a result with more rows is written in full to a file (spilled: true) instead of inline; in a file response, the preview size (default 20)"
         },
         {
           "name": "maxBytes",
           "type": "number",
           "occurs": "?",
           "default": 1048576,
-          "description": "Cap on the serialized rows in bytes (1..16777216); hitting it sets truncated: true"
+          "description": "Inline threshold in serialized bytes (1..16777216): a bigger result is written in full to a file instead of inline"
+        },
+        {
+          "name": "out",
+          "type": "string",
+          "occurs": "?",
+          "description": "Write the full result to this file (streamed; replaced atomically; parent directories created) and return a summary with a preview"
+        },
+        {
+          "name": "outFormat",
+          "type": "string",
+          "occurs": "?",
+          "enum": [
+            "ndjson",
+            "csv",
+            "json"
+          ],
+          "description": "Format of the out file: ndjson (one JSON object per row), csv (RFC 4180, header row) or json (one array); default from the out extension, else ndjson"
         },
         {
           "name": "timeoutMs",
@@ -163,13 +179,13 @@
           "name": "statement",
           "type": "string",
           "positional": true,
-          "description": "Exactly one SQL statement (any SQL: INSERT, UPDATE, DELETE, CREATE, ...; RETURNING and SELECT rows are returned)"
+          "description": "SQL to run (any SQL: INSERT, UPDATE, DELETE, CREATE, ...; RETURNING and SELECT rows are returned)"
         },
         {
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
+          "description": "Path of a SQLite database file, or a postgres:// DSN (prefer connection for DSNs: argv is visible to other users)"
         },
         {
           "name": "connection",
@@ -181,15 +197,31 @@
           "name": "maxRows",
           "type": "number",
           "occurs": "?",
-          "default": 200,
-          "description": "Return at most this many rows (1..10000); more set truncated: true"
+          "description": "Inline threshold (1..10000, default 200): a result with more rows is written in full to a file (spilled: true) instead of inline; in a file response, the preview size (default 20)"
         },
         {
           "name": "maxBytes",
           "type": "number",
           "occurs": "?",
           "default": 1048576,
-          "description": "Cap on the serialized rows in bytes (1..16777216); hitting it sets truncated: true"
+          "description": "Inline threshold in serialized bytes (1..16777216): a bigger result is written in full to a file instead of inline"
+        },
+        {
+          "name": "out",
+          "type": "string",
+          "occurs": "?",
+          "description": "Write the full result to this file (streamed; replaced atomically; parent directories created) and return a summary with a preview"
+        },
+        {
+          "name": "outFormat",
+          "type": "string",
+          "occurs": "?",
+          "enum": [
+            "ndjson",
+            "csv",
+            "json"
+          ],
+          "description": "Format of the out file: ndjson (one JSON object per row), csv (RFC 4180, header row) or json (one array); default from the out extension, else ndjson"
         },
         {
           "name": "timeoutMs",
@@ -210,7 +242,7 @@
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
+          "description": "Path of a SQLite database file, or a postgres:// DSN (prefer connection for DSNs: argv is visible to other users)"
         },
         {
           "name": "connection",
@@ -229,7 +261,7 @@
           "type": "number",
           "occurs": "?",
           "default": 200,
-          "description": "Return at most this many rows (1..10000); more set truncated: true"
+          "description": "List at most this many tables (1..10000); more set truncated: true"
         },
         {
           "name": "timeoutMs",
@@ -256,7 +288,7 @@
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
+          "description": "Path of a SQLite database file, or a postgres:// DSN (prefer connection for DSNs: argv is visible to other users)"
         },
         {
           "name": "connection",

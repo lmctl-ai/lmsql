@@ -48,26 +48,6 @@ pub fn to_json(type_name: &str, text: Option<&str>) -> Value {
   }
 }
 
-/// A lower bound of the serialized size, computed without decoding (huge values are refused
-/// before they are converted, as for SQLite).
-pub fn min_json_len(type_name: &str, text: Option<&str>) -> usize {
-  match text {
-    None => 4,
-    Some(t) if type_name == "bytea" => t.len().saturating_sub(2) / 2 * 4 / 3 + 19,
-    Some(t)
-      if matches!(
-        type_name,
-        "int2" | "int4" | "int8" | "oid" | "float4" | "float8" | "bool"
-      ) =>
-    {
-      t.len().min(1)
-    }
-    // JSON text re-serializes to at least half its length (whitespace dropped); strings keep it.
-    Some(t) if matches!(type_name, "json" | "jsonb") => t.len() / 2,
-    Some(t) => t.len() + 2,
-  }
-}
-
 /// `\x0a1b` (bytea hex output) -> bytes.
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
   let hex = text.strip_prefix("\\x")?;
@@ -173,21 +153,5 @@ mod tests {
       json!("{{1,2},{3,4}}")
     );
     assert_eq!(to_json("mood", Some("happy")), json!("happy"));
-  }
-
-  #[test]
-  fn min_len_is_a_lower_bound() {
-    for (ty, text) in [
-      ("int4", Some("42")),
-      ("float8", Some("NaN")),
-      ("bytea", Some("\\x00ff10ab")),
-      ("jsonb", Some("{\"a\": 1}")),
-      ("text", Some("abc")),
-      ("bool", Some("t")),
-      ("text", None),
-    ] {
-      let real = serde_json::to_string(&to_json(ty, text)).unwrap().len();
-      assert!(min_json_len(ty, text) <= real, "{ty} {text:?}");
-    }
   }
 }
