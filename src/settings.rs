@@ -131,7 +131,9 @@ pub struct Settings {
   pub source: Option<PathBuf>,
   pub allow_direct: bool,
   pub allow_bypass: bool,
-  pub output_dir: Option<String>,
+  /// `output.dir`, resolved (`~/` expanded; relative to the settings file): `out` files and
+  /// spills must stay inside it, and spills go there.
+  pub output_dir: Option<PathBuf>,
   pub connections: BTreeMap<String, Connection>,
 }
 
@@ -203,14 +205,7 @@ impl Settings {
     let doc: Value = serde_json::from_slice(&text)
       .map_err(|e| invalid(&path, format!("is not valid JSON ({e})")))?;
     let home = lookup("HOME");
-    let settings = parse(&doc, &path, home.as_deref())?;
-    if settings.output_dir.is_some() {
-      warn(
-        "lmsql: warning: output.dir is not enforced by this lmsql version (accepted for later)"
-          .to_string(),
-      );
-    }
-    Ok(settings)
+    parse(&doc, &path, home.as_deref())
   }
 
   /// Strings that must not appear in output: paths and DSN values from the file and the
@@ -466,9 +461,17 @@ pub fn parse(doc: &Value, file: &Path, home: Option<&str>) -> Result<Settings, D
   }
   let output_dir = match map.get("output") {
     None => None,
-    Some(v) => {
-      string(object(v, "output", &["dir"], file)?, "dir", "output", file)?.map(str::to_string)
-    }
+    Some(v) => match string(object(v, "output", &["dir"], file)?, "dir", "output", file)? {
+      None => None,
+      Some(dir) => {
+        let mut path = expand_home(dir, home)
+          .ok_or_else(|| invalid(file, "output.dir uses ~ but HOME is not set"))?;
+        if path.is_relative() {
+          path = file.parent().unwrap_or(Path::new(".")).join(path);
+        }
+        Some(path)
+      }
+    },
   };
   let mut connections = BTreeMap::new();
   if let Some(c) = map.get("connections") {

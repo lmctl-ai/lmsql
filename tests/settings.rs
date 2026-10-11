@@ -665,3 +665,93 @@ fn bypass_needs_allow_bypass() {
   assert_eq!(out.code, 0, "{}", out.text());
   assert!(out.stderr.is_empty(), "{}", out.stderr);
 }
+
+// ---- output.dir containment --------------------------------------------------------------------
+
+#[test]
+fn output_dir_contains_out_files_and_spills() {
+  let st = Setup::new();
+  let elsewhere = tempfile::tempdir().unwrap();
+  let settings = |allow_bypass: bool| {
+    json!({"version": 1, "allow_bypass": allow_bypass, "output": {"dir": "results"},
+      "connections": {"app": {"driver": "sqlite", "path": "app.db", "permissions": {"default": "readwrite"}}}})
+  };
+  st.write(&settings(true));
+  let results = st.path("results");
+  std::fs::create_dir(&results).unwrap();
+  std::os::unix::fs::symlink(elsewhere.path(), results.join("link")).unwrap();
+  std::os::unix::fs::symlink(elsewhere.path().join("f.csv"), results.join("f.csv")).unwrap();
+  let r = |rel: &str| s(&results.join(rel));
+  // (out path, extra args, allowed)
+  let cases: Vec<(String, Vec<&str>, bool)> = vec![
+    (r("r.csv"), vec![], true),
+    (r("sub/deeper/r.csv"), vec![], true),
+    (s(&st.path("beside.csv")), vec![], false),
+    (r("../escape.csv"), vec![], false),
+    (r("sub/../../escape.csv"), vec![], false),
+    (r("link/x.csv"), vec![], false),
+    (r("f.csv"), vec![], false),
+    (s(elsewhere.path()), vec![], false),
+    // A dry run is checked too (it writes nothing either way).
+    (s(&st.path("beside.csv")), vec!["--dry-run"], false),
+    // An allowed bypass skips the containment.
+    (
+      s(&st.path("beside.csv")),
+      vec!["--dangerously-bypass-permission-settings"],
+      true,
+    ),
+  ];
+  for (out_path, extra, allowed) in cases {
+    let mut args = vec![
+      "query",
+      "--connection",
+      "app",
+      "SELECT x FROM t",
+      "--out",
+      out_path.as_str(),
+    ];
+    args.extend(extra.iter().copied());
+    let out = st.run(&args, &[]);
+    if allowed {
+      assert_eq!(out.code, 0, "{out_path}: {}", out.text());
+    } else {
+      assert_eq!(
+        code(&out),
+        (6, "PERMISSION_DENIED".into()),
+        "{out_path}: {}",
+        out.text()
+      );
+      assert!(out.text().contains("output.dir"), "{}", out.text());
+    }
+  }
+  assert!(!st.path("escape.csv").exists() && !elsewhere.path().join("x.csv").exists());
+  assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+  // Spills go to output.dir (created 0700), even with LMSQL_OUT_DIR pointing elsewhere.
+  st.write(&settings(false));
+  std::fs::remove_dir_all(&results).unwrap();
+  // A two-row result with a one-row inline threshold spills.
+  rusqlite::Connection::open(st.path("app.db"))
+    .unwrap()
+    .execute("INSERT INTO t VALUES ('two')", [])
+    .unwrap();
+  let out = st.run(
+    &[
+      "query",
+      "--connection",
+      "app",
+      "SELECT x FROM t",
+      "--max-rows",
+      "1",
+    ],
+    &[("LMSQL_OUT_DIR", &s(elsewhere.path()))],
+  );
+  let doc = out.json();
+  assert_eq!(doc["spilled"], true, "{doc}");
+  let file = PathBuf::from(doc["file"]["path"].as_str().unwrap());
+  assert_eq!(file.parent().unwrap(), results.canonicalize().unwrap());
+  assert_eq!(
+    std::fs::metadata(&results).unwrap().permissions().mode() & 0o777,
+    0o700
+  );
+  assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}

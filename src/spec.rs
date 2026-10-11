@@ -240,7 +240,7 @@ fn with_backend(
     // No settings file: nothing to bypass.
     _ => false,
   };
-  let (target, access) = connection::resolve_with(
+  let (target, mut access) = connection::resolve_with(
     text(params, "db"),
     text(params, "connection"),
     &settings,
@@ -248,6 +248,9 @@ fn with_backend(
     env,
   )
   .map_err(|e| e.into_cli_error(&secrets))?;
+  if !bypass {
+    access.output_dir = settings.output_dir.clone();
+  }
   secrets.extend(target.secrets());
   if access.max_level() == Level::None {
     return Err(access.denied(intent).into_cli_error(&secrets));
@@ -284,6 +287,7 @@ fn run_sql(op: &str, params: &Record, dry_run: bool) -> Result<Value, CliError> 
       l.max_bytes,
       params.contains_key("maxRows"),
       dry_run,
+      access.output_dir.as_deref(),
     )?;
     let mut sink = Sink::new(config);
     if dry_run {

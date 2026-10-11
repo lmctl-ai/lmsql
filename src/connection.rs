@@ -114,6 +114,8 @@ pub struct Access {
   pub tables: TableRules,
   /// The settings connection (`None` without a settings file, or for an allowed `--db`).
   pub rule: Option<Rule>,
+  /// The settings file's `output.dir` (unless bypassed): where result files may go.
+  pub output_dir: Option<PathBuf>,
 }
 
 /// Where the level came from: for the denial message and the operator's manual command.
@@ -155,6 +157,7 @@ impl Access {
       level: Level::ReadWrite,
       tables: TableRules::new(Level::ReadWrite, &Default::default()),
       rule: None,
+      output_dir: None,
     }
   }
 
@@ -342,6 +345,7 @@ pub fn resolve_with(
             level: default,
             tables: TableRules::new(default, &tables),
             rule: Some(rule(Manual::Sqlite(written.clone()))),
+            output_dir: None,
           },
         )),
         Driver::Postgres {
@@ -364,6 +368,7 @@ pub fn resolve_with(
             level: default,
             tables: TableRules::new(default, &Default::default()),
             rule: Some(rule(manual)),
+            output_dir: None,
           };
           if default == Level::None {
             // Never connects; no DSN needed.

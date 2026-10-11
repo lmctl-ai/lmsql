@@ -87,6 +87,8 @@ pub struct OutputConfig {
   pub preview_rows: usize,
   /// Dry run: no file is ever written (out is reported as `would_write`).
   pub dry_run: bool,
+  /// The settings file's `output.dir`: `out` must resolve inside it, and spills go there.
+  pub root: Option<PathBuf>,
 }
 
 impl OutputConfig {
@@ -98,6 +100,7 @@ impl OutputConfig {
     inline_bytes: usize,
     max_rows_given: bool,
     dry_run: bool,
+    root: Option<&Path>,
   ) -> Result<OutputConfig, DbError> {
     let format = match out_format {
       None => None,
@@ -122,6 +125,9 @@ impl OutputConfig {
       }
       Some(raw) => {
         let path = absolute(raw)?;
+        if let Some(root) = root {
+          contain(root, &path)?;
+        }
         if !dry_run {
           preflight(&path)?;
         }
@@ -139,7 +145,56 @@ impl OutputConfig {
         DEFAULT_PREVIEW_ROWS.min(inline_rows)
       },
       dry_run,
+      root: root.map(Path::to_path_buf),
     })
+  }
+}
+
+/// Where `path` really is: canonical (symlinks and `..` followed). For a path that does not exist
+/// yet, the canonical nearest existing ancestor plus the remaining names (`None` if a remaining
+/// component is `..`, which cannot be resolved).
+fn resolve_real(path: &Path) -> Option<PathBuf> {
+  let mut rest = Vec::new();
+  let mut current = path.to_path_buf();
+  for _ in 0..64 {
+    if let Ok(mut real) = current.canonicalize() {
+      for name in rest.iter().rev() {
+        real.push(name);
+      }
+      return Some(real);
+    }
+    // A dangling symlink: follow it to where it points.
+    if let Ok(target) = std::fs::read_link(&current) {
+      current = match target.is_absolute() {
+        true => target,
+        false => current.parent()?.join(target),
+      };
+      continue;
+    }
+    rest.push(current.file_name()?.to_os_string());
+    current = current.parent()?.to_path_buf();
+  }
+  None
+}
+
+/// `output.dir` containment: `path` must resolve inside `root`.
+fn contain(root: &Path, path: &Path) -> Result<(), DbError> {
+  let inside = match (resolve_real(root), resolve_real(path)) {
+    (Some(root), Some(real)) => real.starts_with(&root) && real != root,
+    _ => false,
+  };
+  if inside {
+    Ok(())
+  } else {
+    Err(DbError::new(
+      ErrorCode::Forbidden,
+      "PERMISSION_DENIED",
+      format!(
+        "permission denied: out {} is outside output.dir {} (settings file); write under that directory",
+        path.display(),
+        root.display()
+      ),
+    ))
   }
 }
 
@@ -205,10 +260,14 @@ fn create_temp(dir: &Path, name: &str) -> Result<(PathBuf, File), DbError> {
   Ok((temp, file))
 }
 
-/// `$LMSQL_OUT_DIR`, or `<temp>/lmsql` (created 0700; it must be a real directory owned by this
-/// user and closed to others, since the system temp directory is shared).
-pub fn spill_dir() -> Result<PathBuf, DbError> {
-  let configured = std::env::var(OUT_DIR_ENV).ok().filter(|d| !d.is_empty());
+/// The settings file's `output.dir` if set, else `$LMSQL_OUT_DIR`, else `<temp>/lmsql` (created
+/// 0700; the default must be a real directory owned by this user and closed to others, since the
+/// system temp directory is shared).
+pub fn spill_dir(root: Option<&Path>) -> Result<PathBuf, DbError> {
+  let configured = match root {
+    Some(root) => Some(root.display().to_string()),
+    None => std::env::var(OUT_DIR_ENV).ok().filter(|d| !d.is_empty()),
+  };
   let default = configured.is_none();
   let dir = match configured {
     Some(d) => std::path::absolute(&d).map_err(|e| io_error("resolve", Path::new(&d), &e))?,
@@ -249,7 +308,7 @@ pub fn spill_dir() -> Result<PathBuf, DbError> {
 }
 
 /// `lmsql-<UTC yyyymmddThhmmssZ>-<random>.ndjson` in the spill directory.
-fn spill_path() -> Result<PathBuf, DbError> {
+fn spill_path(root: Option<&Path>) -> Result<PathBuf, DbError> {
   let secs = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map(|d| d.as_secs())
@@ -262,7 +321,7 @@ fn spill_path() -> Result<PathBuf, DbError> {
     rem % 3600 / 60,
     rem % 60
   );
-  Ok(spill_dir()?.join(format!("lmsql-{stamp}-{}.ndjson", &random_hex()[..8])))
+  Ok(spill_dir(root)?.join(format!("lmsql-{stamp}-{}.ndjson", &random_hex()[..8])))
 }
 
 /// Days since 1970-01-01 -> (year, month, day) (H. Hinnant's civil_from_days).
@@ -621,7 +680,8 @@ impl Sink {
       return Ok(());
     }
     // Past an inline threshold: everything goes to a spill file instead.
-    let mut file = FileWriter::create(&spill_path()?, Format::Ndjson, &self.columns)?;
+    let spill = spill_path(self.config.root.as_deref())?;
+    let mut file = FileWriter::create(&spill, Format::Ndjson, &self.columns)?;
     let buffered = std::mem::take(&mut self.inline);
     for row in &buffered {
       file.write_row(row)?;
