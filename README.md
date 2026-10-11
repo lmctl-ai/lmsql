@@ -46,6 +46,58 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO lmsql_ro;
 ALTER ROLE lmsql_ro SET default_transaction_read_only = on;
 ```
 
+## Permissions (settings file)
+
+lmsql's own permission layer **only restricts further**: it never grants more than the database
+allows. The real boundary is the database role (PostgreSQL) or the file permissions (SQLite);
+connect as a read-only role when nothing should be written.
+
+Without a settings file lmsql is open, as described above. With one, it decides which
+connections exist and how much lmsql may do with each. The file is `$LMSQL_CONFIG`, else
+`$XDG_CONFIG_HOME/lmsql/settings.json`, else `~/.config/lmsql/settings.json`; keep it mode 0600
+(lmsql warns on stderr if group or others can write it).
+
+```json
+{
+  "version": 1,
+  "allow_direct": false,
+  "connections": {
+    "app":  {"driver": "sqlite", "path": "~/data/app.sqlite",
+             "permissions": {"default": "readonly"}},
+    "prod": {"driver": "postgres",
+             "logins": {"readonly":  {"dsn_env": "PROD_RO_DSN"},
+                        "readwrite": {"dsn_env": "PROD_RW_DSN"}},
+             "permissions": {"default": "readonly"}}
+  }
+}
+```
+
+- **Fail closed.** A file that exists but cannot be read, is not valid JSON, has an unknown key,
+  a wrong type or an unknown level is an error (`SETTINGS_INVALID`, naming the file and the key);
+  lmsql never falls back to open.
+- **Connections.** `--connection NAME` resolves only through the file (the `LMSQL_<NAME>`
+  fallback applies only when there is no file). A SQLite `path` may start with `~/`; a relative
+  path is relative to the settings file. A PostgreSQL login names an environment variable holding
+  the DSN (`dsn_env`, preferred) or holds it literally (`dsn`). The caller only ever needs the
+  connection name; paths and DSNs are never echoed.
+- **Direct access.** `--db PATH|DSN` is refused (`DIRECT_NOT_ALLOWED`) unless `"allow_direct":
+  true`.
+- **Levels** (`permissions.default`, required): `none` — every operation is refused; `readonly`
+  — SQLite is opened read-only with `query_only` (the file is never created); PostgreSQL uses the
+  `readonly` login if there is one, else the `readwrite` login, and every transaction of the
+  session starts READ ONLY (`default_transaction_read_only`) — SQL could change that setting, so
+  without a read-only login this is weaker than a real read-only role; `readwrite` — as without
+  settings (the `readwrite` login, or the only one).
+- **Denials** are one short error: `FORBIDDEN` (exit 6) with `tool_code` `PERMISSION_DENIED`,
+  naming the connection, the rule and the settings file. `error.data.manual_command` is the
+  equivalent command for the operator to run in their own shell with the original client, e.g.
+  `sqlite3 ~/'data/app.sqlite' 'DELETE FROM t'` or `psql "$PROD_RW_DSN" -c 'DELETE FROM t'` (the
+  environment variable name only, never its value).
+- **Coming next** (accepted in the file's schema where noted, not enforced yet): per-table levels
+  for SQLite (`permissions.tables`; rejected for PostgreSQL — use grants/roles), a dry-run mode,
+  a gated bypass flag (`allow_bypass`), `output.dir` containment for result files (accepted; a
+  warning says it is not enforced yet), and an operator-only `lmsql config` helper.
+
 ## Big results go to a file
 
 lmsql never truncates a result and never pages it. If it is small, the rows come back inline. If

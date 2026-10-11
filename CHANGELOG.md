@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+Permission settings, slice 1.
+
+- A settings file (`$LMSQL_CONFIG`, else `$XDG_CONFIG_HOME/lmsql/settings.json`, else
+  `~/.config/lmsql/settings.json`) that only restricts; without it lmsql is open as in 0.2.0.
+  Invalid files fail closed (`SETTINGS_INVALID`); a group/other-writable file is warned about.
+- With a settings file, `--connection` resolves through it (sqlite path, or postgres logins via
+  `dsn_env` / `dsn`), `--db` needs `allow_direct` (`DIRECT_NOT_ALLOWED`), and paths / DSN values
+  from the file join the scrub set.
+- Connection levels `none` / `readonly` / `readwrite`: SQLite readonly opens read-only with
+  `query_only`; PostgreSQL readonly uses the readonly login (else the readwrite login) with every
+  transaction READ ONLY. Denials are `FORBIDDEN` / `PERMISSION_DENIED` with
+  `error.data.manual_command` for the operator.
+- `--help` text updated (it still described the 0.1 confirm/read-only model).
+
 ## 0.2.0 (unreleased)
 
 Open mode, a PostgreSQL backend, and big results to a file.

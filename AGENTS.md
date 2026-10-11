@@ -18,6 +18,12 @@ permissions), not with lmsql. The earlier guard implementation is in git history
 - **Policy seam.** Every request passes through `crate::policy::Policy` (`src/policy.rs`). v1
   allows everything and records `LMSQL_CONFIG`; put future limits here, not in the backends or the
   op handlers.
+- **Settings only restrict, and fail closed.** `src/settings.rs`: no file = open; a present file
+  that is not exactly valid = `SETTINGS_INVALID`, never open. Connection levels are enforced by
+  the database handle (SQLite read-only + `query_only`; PostgreSQL READ ONLY session / readonly
+  login), not by reading the SQL text. Denials are `PERMISSION_DENIED` with `manual_command`
+  (never a secret value). Tests pin `LMSQL_CONFIG` to a missing file
+  (`durable-memory/permissions.md`).
 - **Stateless.** One process, one connection, one statement batch; nothing persists between
   calls (no caches, lock files or leftover temp files). The only files lmsql writes are the
   declared `out` file and spill files (`src/output.rs`); tests check that a call leaves nothing

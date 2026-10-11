@@ -20,13 +20,13 @@ pub const TOOL: &str = "lmsql";
 fn db_param() -> ParamSpec {
   ParamSpec::new("db", ParamType::String)
     .optional()
-    .describe("Path of a SQLite database file, or a postgres:// DSN (prefer connection for DSNs: argv is visible to other users)")
+    .describe("Path of a SQLite database file, or a postgres:// DSN (prefer connection: argv is visible to other users). With a settings file, allowed only if it sets allow_direct")
 }
 
 fn connection_param() -> ParamSpec {
   ParamSpec::new("connection", ParamType::String)
     .optional()
-    .describe("Name of a configured connection: the environment variable LMSQL_<NAME> holds a SQLite path or a postgres:// DSN")
+    .describe("Name of a configured connection: from the settings file if there is one (which also sets its permission level), else the environment variable LMSQL_<NAME> holding a SQLite path or a postgres:// DSN")
 }
 
 fn schema_param() -> ParamSpec {
