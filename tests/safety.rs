@@ -296,14 +296,14 @@ fn max_bytes_caps_the_rows_without_dropping_silently() {
 }
 
 #[test]
-fn huge_blobs_are_refused_by_size_before_encoding() {
+fn huge_blobs_are_truncated_or_refused_never_returned_whole() {
   let (_d, db) = fixture();
-  // 50 MB blob built in SQL; the default 1 MiB cap stops it with zero rows.
+  // 20 MB (under the 32 MiB value limit): the default 1 MiB cap stops it with zero rows.
   let out = run(&[
     "query",
     "--db",
     &s(&db),
-    "SELECT zeroblob(50000000) AS b, 1",
+    "SELECT zeroblob(20000000) AS b, 1",
   ]);
   let doc = out.json();
   assert_eq!(out.code, 0);
@@ -312,6 +312,14 @@ fn huge_blobs_are_refused_by_size_before_encoding() {
     (json!(0), json!("max_bytes"))
   );
   assert!(out.stdout.len() < 4096);
+  // 50 MB is over the value limit: SQLite refuses to build it.
+  let out = run(&[
+    "query",
+    "--db",
+    &s(&db),
+    "SELECT zeroblob(50000000) AS b, 1",
+  ]);
+  assert_eq!((out.code, out.tool_code().as_str()), (2, "SQLITE_TOOBIG"));
   // Under the cap it comes back as base64.
   let out = run(&["query", "--db", &s(&db), "SELECT zeroblob(3)"]);
   assert_eq!(out.json()["rows"][0][0], json!({"$blob_base64": "AAAA"}));

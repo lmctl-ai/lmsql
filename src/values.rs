@@ -104,8 +104,16 @@ pub fn min_json_len(value: rusqlite::types::ValueRef<'_>) -> usize {
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[cfg(test)]
+thread_local! {
+  /// Bytes base64-encoded on this thread (tests prove huge values are refused before encoding).
+  pub static ENCODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Standard padded base64 (RFC 4648 section 4).
 pub fn base64(bytes: &[u8]) -> String {
+  #[cfg(test)]
+  ENCODED_BYTES.with(|n| n.set(n.get() + bytes.len()));
   let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
   for chunk in bytes.chunks(3) {
     let b = [

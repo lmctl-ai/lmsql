@@ -16,6 +16,16 @@
 //!
 //! Exactly one statement per call: [`single_statement`] prepares with `sqlite3_prepare_v2` and
 //! uses its tail (via `rusqlite::Batch`) to reject anything after the first statement.
+//!
+//! Resources: every connection gets size and shape limits ([`MAX_VALUE_BYTES`] and friends) so
+//! one builtin (`printf`, `randomblob`, `zeroblob`, `hex`) cannot allocate past them
+//! (`SQLITE_TOOBIG`), and the process has a hard SQLite heap limit ([`HEAP_LIMIT_BYTES`],
+//! `SQLITE_NOMEM`). Time: one deadline per call, checked every [`PROGRESS_STEPS`] VM steps by the
+//! progress handler and by the busy handler while waiting for a lock. A single VM step (one
+//! builtin call) is not interruptible; the limits above bound what it can do.
+//!
+//! Paths: [`check_path`] refuses anything but an existing regular file (symlinks followed),
+//! `:memory:` and blank names before SQLite opens anything (a fifo would block the open).
 
 use super::{Backend, Column, ColumnInfo, ExecOutcome, Rows, TableDescription, TableEntry};
 use crate::error::DbError;
@@ -26,11 +36,47 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
 use rusqlite::{Batch, Connection, OpenFlags, Statement};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// VM instructions between deadline checks (a few microseconds of work).
-const PROGRESS_STEPS: i32 = 1_000;
+pub const PROGRESS_STEPS: i32 = 1_000;
+
+/// Longest string or blob SQLite may build or read (`SQLITE_LIMIT_LENGTH`): twice the hard
+/// `maxBytes` cap, so every value a result can carry fits and nothing much larger is allocated.
+pub const MAX_VALUE_BYTES: i32 = 32 << 20;
+/// Longest statement text (`SQLITE_LIMIT_SQL_LENGTH`).
+pub const MAX_STATEMENT_BYTES: i32 = 16 << 20;
+/// Expression nesting (`SQLITE_LIMIT_EXPR_DEPTH`; SQLite's default is 1000).
+pub const MAX_EXPR_DEPTH: i32 = 500;
+/// Terms of a compound SELECT (`SQLITE_LIMIT_COMPOUND_SELECT`; default 500).
+pub const MAX_COMPOUND_SELECT: i32 = 200;
+/// Arguments of one function call (`SQLITE_LIMIT_FUNCTION_ARG`; pinned at SQLite's default).
+pub const MAX_FUNCTION_ARGS: i32 = 127;
+/// Length of a LIKE/GLOB pattern (`SQLITE_LIMIT_LIKE_PATTERN_LENGTH`; default 50000).
+pub const MAX_LIKE_PATTERN: i32 = 10_000;
+/// Hard ceiling on SQLite's heap for the whole process (`sqlite3_hard_heap_limit64`).
+pub const HEAP_LIMIT_BYTES: i64 = 256 << 20;
+
+thread_local! {
+  /// The deadline of the call running on this thread, shared by the busy handler and the
+  /// progress handler (lmsql runs one call per process).
+  static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Busy handler: keep waiting for the lock only until the call's deadline.
+fn wait_until_deadline(_attempt: i32) -> bool {
+  let Some(deadline) = DEADLINE.with(Cell::get) else {
+    return false;
+  };
+  let now = Instant::now();
+  if now >= deadline {
+    return false;
+  }
+  std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+  true
+}
 
 pub struct Sqlite {
   path: PathBuf,
@@ -75,21 +121,60 @@ pub fn literal_path(path: &std::path::Path) -> PathBuf {
   }
 }
 
-/// Open and harden a connection (see the module docs); the deadline starts now.
-pub fn open(path: &std::path::Path, mode: Mode, limits: &Limits) -> Result<Connection, DbError> {
-  let path = &literal_path(path);
-  if mode == Mode::Read && !path.exists() {
-    // Report a missing file the same way for every mode (SQLite says "unable to open").
+/// Refuse what must never reach `sqlite3_open`: special and blank names, and anything that is
+/// not an existing regular file (symlinks followed). A missing file is fine only for
+/// `exec --create`. Checked before opening, so a fifo cannot block the call.
+pub fn check_path(path: &Path, mode: Mode) -> Result<(), DbError> {
+  let text = path.to_string_lossy();
+  if text.trim().is_empty() || text == ":memory:" {
     return Err(DbError::new(
-      ErrorCode::NotFound,
-      "SQLITE_CANTOPEN",
-      "the database file does not exist",
+      ErrorCode::ValidationError,
+      "INVALID_DB_PATH",
+      "db must name a database file (not blank, not :memory:)",
     ));
   }
+  match std::fs::metadata(path) {
+    Ok(meta) if meta.is_file() => Ok(()),
+    Ok(_) => Err(DbError::new(
+      ErrorCode::ValidationError,
+      "NOT_A_REGULAR_FILE",
+      "db is not a regular file (a directory, device or fifo)",
+    )),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => match mode {
+      Mode::Write { create: true } => Ok(()),
+      _ => Err(DbError::new(
+        ErrorCode::NotFound,
+        "SQLITE_CANTOPEN",
+        "the database file does not exist",
+      )),
+    },
+    Err(_) => Err(DbError::new(
+      ErrorCode::Forbidden,
+      "SQLITE_CANTOPEN",
+      "the database file is not accessible",
+    )),
+  }
+}
+
+/// Process-wide SQLite heap ceiling; idempotent.
+pub fn set_heap_limit() {
+  // SAFETY: plain configuration call on the bundled SQLite; safe at any time.
+  unsafe {
+    rusqlite::ffi::sqlite3_hard_heap_limit64(HEAP_LIMIT_BYTES);
+  }
+}
+
+/// Open and harden a connection (see the module docs); the call's deadline starts now.
+pub fn open(path: &Path, mode: Mode, limits: &Limits) -> Result<Connection, DbError> {
+  let path = &literal_path(path);
+  check_path(path, mode)?;
+  set_heap_limit();
+  let deadline = Instant::now() + limits.timeout;
+  DEADLINE.with(|d| d.set(Some(deadline)));
   let conn = Connection::open_with_flags(path, open_flags(mode))?;
   harden(&conn, mode)?;
-  conn.busy_timeout(limits.timeout)?;
-  let deadline = Instant::now() + limits.timeout;
+  // Lock waits and statement work share the one deadline.
+  conn.busy_handler(Some(wait_until_deadline))?;
   // Interrupts long statements (SQLITE_INTERRUPT -> TIMEOUT) and long row iteration.
   conn.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() >= deadline));
   Ok(conn)
@@ -100,6 +185,12 @@ pub fn harden(conn: &Connection, mode: Mode) -> Result<(), DbError> {
   conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
   conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
   conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0);
+  conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES);
+  conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_STATEMENT_BYTES);
+  conn.set_limit(Limit::SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPR_DEPTH);
+  conn.set_limit(Limit::SQLITE_LIMIT_COMPOUND_SELECT, MAX_COMPOUND_SELECT);
+  conn.set_limit(Limit::SQLITE_LIMIT_FUNCTION_ARG, MAX_FUNCTION_ARGS);
+  conn.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, MAX_LIKE_PATTERN);
   if mode == Mode::Read {
     set_query_only(conn)?;
   }
@@ -491,6 +582,100 @@ mod tests {
         "{mode:?}"
       );
     }
+  }
+
+  #[test]
+  fn values_over_the_byte_cap_are_refused_before_they_are_encoded() {
+    use crate::values::ENCODED_BYTES;
+    let conn = Connection::open_in_memory().unwrap();
+    let limits = Limits {
+      max_bytes: 1_000,
+      ..Limits::default()
+    };
+    ENCODED_BYTES.with(|n| n.set(0));
+    let mut stmt = conn.prepare("SELECT zeroblob(20000000)").unwrap();
+    let rows = collect_rows(&mut stmt, &limits).unwrap();
+    assert_eq!((rows.rows.len(), rows.truncated_by), (0, Some("max_bytes")));
+    assert_eq!(
+      ENCODED_BYTES.with(|n| n.get()),
+      0,
+      "the 20 MB blob was encoded"
+    );
+    // A value within the cap is encoded (the counter is live).
+    let mut stmt = conn.prepare("SELECT zeroblob(30)").unwrap();
+    let rows = collect_rows(&mut stmt, &limits).unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(ENCODED_BYTES.with(|n| n.get()), 30);
+  }
+
+  #[test]
+  fn harden_sets_size_and_shape_limits_in_every_mode() {
+    let (_d, path) = temp_db();
+    for mode in [Mode::Read, Mode::Write { create: false }] {
+      let conn = open(&path, mode, &Limits::default()).unwrap();
+      assert_eq!(conn.limit(Limit::SQLITE_LIMIT_LENGTH), 32 << 20, "{mode:?}");
+      assert_eq!(
+        conn.limit(Limit::SQLITE_LIMIT_SQL_LENGTH),
+        16 << 20,
+        "{mode:?}"
+      );
+      assert_eq!(conn.limit(Limit::SQLITE_LIMIT_EXPR_DEPTH), 500, "{mode:?}");
+      assert_eq!(
+        conn.limit(Limit::SQLITE_LIMIT_COMPOUND_SELECT),
+        200,
+        "{mode:?}"
+      );
+      assert_eq!(
+        conn.limit(Limit::SQLITE_LIMIT_FUNCTION_ARG),
+        127,
+        "{mode:?}"
+      );
+      assert_eq!(
+        conn.limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH),
+        10_000,
+        "{mode:?}"
+      );
+      let err = conn
+        .query_row("SELECT length(zeroblob(40000000))", [], |r| {
+          r.get::<_, i64>(0)
+        })
+        .unwrap_err();
+      assert_eq!(DbError::from(err).tool_code, "SQLITE_TOOBIG", "{mode:?}");
+    }
+  }
+
+  #[test]
+  fn opening_sets_the_hard_heap_limit() {
+    let (_d, path) = temp_db();
+    let _conn = open(&path, Mode::Read, &Limits::default()).unwrap();
+    // A negative argument reads the current limit without changing it.
+    let limit = unsafe { rusqlite::ffi::sqlite3_hard_heap_limit64(-1) };
+    assert_eq!(limit, 256 << 20);
+  }
+
+  #[test]
+  fn the_busy_wait_shares_the_call_deadline() {
+    let (_d, path) = temp_db();
+    let limits = Limits {
+      timeout: std::time::Duration::from_millis(600),
+      ..Limits::default()
+    };
+    let conn = open(&path, Mode::Read, &limits).unwrap();
+    // Most of the budget is spent before the lock is needed.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    let holder = Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let started = Instant::now();
+    let err = conn
+      .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+      .unwrap_err();
+    assert_eq!(DbError::from(err).tool_code, "SQLITE_BUSY");
+    // About 150 ms were left; a fresh per-wait timeout would wait the full 600 ms.
+    assert!(
+      started.elapsed() < std::time::Duration::from_millis(400),
+      "{:?}",
+      started.elapsed()
+    );
   }
 
   #[test]
