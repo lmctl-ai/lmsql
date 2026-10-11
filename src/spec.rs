@@ -3,11 +3,12 @@
 use crate::backend::{Backend, Target};
 use crate::connection;
 use crate::error::DbError;
+use crate::policy::Policy as OpenPolicy;
 use crate::values::{
   Limits, DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_MS, HARD_MAX_BYTES, HARD_MAX_ROWS,
   HARD_TIMEOUT_MS,
 };
-use lmrust::server::{check_policy, CheckContext, CliError, CliSpec, OpDef, Policy};
+use lmrust::server::{CliError, CliSpec, OpDef, Policy};
 use lmrust::{Access, InputForm, OperationSchema, ParamSpec, ParamType, Record, ReturnType};
 use serde_json::{json, Value};
 
@@ -85,10 +86,10 @@ pub fn schemas() -> Vec<OperationSchema> {
   vec![
     schema(
       "query",
-      Access::Read,
-      "Run one read-only SQL statement and return columns and rows as JSON",
+      Access::Dynamic,
+      "Run SQL and return columns and rows as JSON (open mode: runs any statement the database accepts; identical to exec)",
       vec![
-        statement_param("read-only: SELECT, WITH ... SELECT, read PRAGMA, EXPLAIN"),
+        statement_param("any SQL; multiple statements run in order and the last one's rows are returned"),
         db_param(),
         connection_param(),
         max_rows_param(),
@@ -98,15 +99,12 @@ pub fn schemas() -> Vec<OperationSchema> {
     ),
     schema(
       "exec",
-      Access::Write,
-      "Run one SQL statement that changes data or schema in its own transaction; returns rows_affected and last_insert_rowid (null on PostgreSQL)",
+      Access::Dynamic,
+      "Run SQL and return rows plus rows_affected and last_insert_rowid (open mode: identical to query; both run any statement)",
       vec![
-        statement_param("INSERT, UPDATE, DELETE, CREATE, ...; RETURNING rows are returned"),
+        statement_param("any SQL: INSERT, UPDATE, DELETE, CREATE, ...; RETURNING and SELECT rows are returned"),
         db_param(),
         connection_param(),
-        ParamSpec::new("create", ParamType::Boolean)
-          .optional()
-          .describe("Create the SQLite database file if it does not exist"),
         max_rows_param(),
         max_bytes_param(),
         timeout_param(),
@@ -174,6 +172,16 @@ fn statement(params: &Record) -> &str {
   text(params, "statement").unwrap_or_default()
 }
 
+/// `query` and `exec` are identical in open mode: both pass the SQL through the policy seam
+/// (which allows everything in v1) and run it, returning one shape.
+fn run_sql(op: &str, params: &Record) -> Result<Value, CliError> {
+  let sql = statement(params).to_string();
+  with_backend(params, |b, l| {
+    OpenPolicy::load().allow(op, &sql)?;
+    b.run(&sql, l).map(|r| r.to_json())
+  })
+}
+
 pub fn spec() -> CliSpec<Policy> {
   let ops = schemas();
   let op = |name: &str| {
@@ -190,33 +198,18 @@ pub fn spec() -> CliSpec<Policy> {
     .op(
       OpDef::new(
         "query",
-        Access::Read,
+        Access::Dynamic,
         op("query").description.unwrap_or_default(),
-        |params, _| {
-          with_backend(params, |b, l| {
-            b.query(statement(params), l).map(|r| r.to_json())
-          })
-        },
+        |params, _| run_sql("query", params),
       )
       .schema(op("query")),
     )
     .op(
       OpDef::new(
         "exec",
-        Access::Write,
+        Access::Dynamic,
         op("exec").description.unwrap_or_default(),
-        |params, policy: &Policy| {
-          // The statement is not echoed into the policy result: it may hold literals the caller
-          // treats as sensitive, and the caller already has it.
-          let ctx = CheckContext::new("exec").dangerous(true);
-          if let Some(simulated) = check_policy(Access::Write, policy, &ctx)? {
-            return Ok(Value::Object(simulated));
-          }
-          let create = params.get("create") == Some(&Value::Bool(true));
-          with_backend(params, |b, l| {
-            b.exec(statement(params), l, create).map(|r| r.to_json())
-          })
-        },
+        |params, _| run_sql("exec", params),
       )
       .schema(op("exec")),
     )
@@ -287,8 +280,8 @@ mod tests {
     assert_eq!(
       ops,
       [
-        ("query", "read"),
-        ("exec", "write"),
+        ("query", "dynamic"),
+        ("exec", "dynamic"),
         ("tables", "read"),
         ("describe", "read")
       ]

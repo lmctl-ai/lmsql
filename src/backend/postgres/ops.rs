@@ -1,25 +1,26 @@
-//! The four operations on PostgreSQL.
+//! The operations on PostgreSQL, open mode: run any SQL over an autocommit session.
+//!
+//! A single row-returning statement is read through a cursor so a huge result stops at the cap
+//! without materializing. Anything else (writes, DDL, `RETURNING`, utility statements, or
+//! multi-statement text) runs over the simple query protocol; its last statement's rows are
+//! returned, capped. Values come back in PostgreSQL's text format and are typed by the column's
+//! type where lmsql knows it (always on the cursor path; by the prepared statement on the
+//! RETURNING fallback; by name only for free-form multi-statement text).
 
-use super::classify::{self, Shape};
 use super::values::{min_json_len, to_json};
-use super::{begin, connect, Guards, Postgres, Session};
-use crate::backend::{
-  Backend, Column, ColumnInfo, ExecOutcome, Rows, TableDescription, TableEntry,
-};
+use super::{connect, Postgres};
+use crate::backend::{Backend, Column, ColumnInfo, Rows, RunOutcome, TableDescription, TableEntry};
 use crate::error::DbError;
 use crate::values::Limits;
-use fallible_iterator::FallibleIterator;
-use lmrust::server::ErrorCode;
-use postgres::types::{FromSql, ToSql, Type};
 use postgres::{SimpleQueryMessage, Transaction};
 use serde_json::Value;
 
 const CURSOR: &str = "lmsql_cursor";
 
 /// Cursor batches grow from 8 rows to this: a cap is overshot by at most one batch.
-pub const MAX_BATCH: usize = 256;
+const MAX_BATCH: usize = 256;
 
-/// Collects rows under the caps; `push` returns false when the caller must stop reading.
+/// Collects text rows under the caps; `push` returns false when the caller should stop.
 struct Sink<'l> {
   types: Vec<String>,
   rows: Vec<Vec<Value>>,
@@ -46,18 +47,17 @@ impl<'l> Sink<'l> {
     }
     let width = texts.len();
     let mut lower = 2 + width.saturating_sub(1);
-    for (ty, t) in self.types.iter().zip(texts) {
-      lower += min_json_len(ty, *t);
+    for (i, t) in texts.iter().enumerate() {
+      lower += min_json_len(self.type_at(i), *t);
     }
     if self.bytes + lower + 1 > self.limits.max_bytes {
       self.truncated_by = Some("max_bytes");
       return false;
     }
-    let values: Vec<Value> = self
-      .types
+    let values: Vec<Value> = texts
       .iter()
-      .zip(texts)
-      .map(|(ty, t)| to_json(ty, *t))
+      .enumerate()
+      .map(|(i, t)| to_json(self.type_at(i), *t))
       .collect();
     let size = serde_json::to_string(&values)
       .map(|s| s.len())
@@ -72,64 +72,33 @@ impl<'l> Sink<'l> {
     true
   }
 
-  fn finish(self, columns: Vec<Column>) -> Rows {
-    Rows {
-      columns,
-      rows: self.rows,
-      truncated_by: self.truncated_by,
-    }
+  fn type_at(&self, i: usize) -> &str {
+    self.types.get(i).map(String::as_str).unwrap_or("text")
   }
 }
 
-/// A text-like column read from the extended protocol (EXPLAIN, SHOW, `::text` casts).
-struct RawText(String);
-
-impl<'a> FromSql<'a> for RawText {
-  fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-    // jsonb's binary form is a version byte followed by the JSON text.
-    let raw = if *ty == Type::JSONB {
-      raw.get(1..).unwrap_or_default()
-    } else {
-      raw
-    };
-    Ok(RawText(String::from_utf8(raw.to_vec())?))
-  }
-  fn accepts(ty: &Type) -> bool {
-    matches!(
-      *ty,
-      Type::TEXT
-        | Type::VARCHAR
-        | Type::BPCHAR
-        | Type::NAME
-        | Type::UNKNOWN
-        | Type::JSON
-        | Type::JSONB
-        | Type::XML
-    )
-  }
-}
-
-fn columns_of(stmt: &postgres::Statement) -> Vec<Column> {
-  stmt
+fn columns(stmt: &postgres::Statement) -> (Vec<Column>, Vec<String>) {
+  let cols = stmt
     .columns()
     .iter()
     .map(|c| Column {
       name: c.name().to_string(),
       decl_type: Some(c.type_().name().to_string()),
     })
-    .collect()
+    .collect();
+  let types = stmt
+    .columns()
+    .iter()
+    .map(|c| c.type_().name().to_string())
+    .collect();
+  (cols, types)
 }
 
-fn no_params() -> std::iter::Empty<&'static (dyn ToSql + Sync)> {
-  std::iter::empty()
-}
-
-/// Read a declared cursor in growing batches over the simple protocol (text values).
+/// Read a cursor in growing batches over the simple protocol (text values).
 fn fetch_cursor(tx: &mut Transaction<'_>, sink: &mut Sink<'_>) -> Result<(), postgres::Error> {
   let mut batch = 8usize;
   loop {
-    let want = (sink.limits.max_rows + 1 - sink.rows.len().min(sink.limits.max_rows)).min(batch);
-    let messages = tx.simple_query(&format!("FETCH FORWARD {want} FROM {CURSOR}"))?;
+    let messages = tx.simple_query(&format!("FETCH FORWARD {batch} FROM {CURSOR}"))?;
     let mut got = 0;
     for message in &messages {
       if let SimpleQueryMessage::Row(row) = message {
@@ -140,101 +109,71 @@ fn fetch_cursor(tx: &mut Transaction<'_>, sink: &mut Sink<'_>) -> Result<(), pos
         }
       }
     }
-    if got < want {
+    if got < batch {
       return Ok(());
     }
     batch = (batch * 2).min(MAX_BATCH);
   }
 }
 
-/// Stream extended-protocol rows of text-like columns; returns how many rows the server sent.
-fn stream_text_rows(
-  rows: postgres::RowIter<'_>,
-  sink: &mut Sink<'_>,
-  drain: bool,
-) -> Result<u64, postgres::Error> {
-  let mut rows = rows;
-  let mut count = 0u64;
-  let mut open = true;
-  while let Some(row) = rows.next()? {
-    count += 1;
-    if !open {
-      continue; // drained for the row count, not stored
-    }
-    let texts: Vec<Option<String>> = (0..row.len())
-      .map(|i| {
-        row
-          .try_get::<_, Option<RawText>>(i)
-          .ok()
-          .flatten()
-          .map(|t| t.0)
-      })
-      .collect();
-    let refs: Vec<Option<&str>> = texts.iter().map(|t| t.as_deref()).collect();
-    if !sink.push(&refs) {
-      open = false;
-      if !drain {
-        break;
-      }
-    }
-  }
-  Ok(count)
-}
-
-fn is_cursor_statement(shape: &Shape) -> bool {
-  let first = shape.first_word().unwrap_or_default();
-  let writes = shape
-    .words()
-    .any(|(_, w, _)| matches!(w, "insert" | "update" | "delete" | "merge"));
-  matches!(first, "select" | "values" | "table") || (first == "with" && !writes)
-}
-
-impl Postgres {
-  /// `query` with explicit layers (tests switch one off; production uses [`Guards::ALL`]).
-  pub fn query_with(&self, sql: &str, limits: &Limits, guards: Guards) -> Result<Rows, DbError> {
-    let shape = classify::single_statement(sql)?;
-    if guards.statement_rules {
-      classify::check_read_only(&shape)?;
-    }
-    let (a, b) = shape.body();
-    let body = &sql[a..b];
-    let mut session = connect(&self.dsn, limits)?;
-    read_rows(&mut session, &shape, body, limits, guards)
-  }
-}
-
-fn read_rows(
-  session: &mut Session,
-  shape: &Shape,
-  body: &str,
+/// The last statement's rows and the last command tag, from a simple-query batch. `types` is the
+/// prepared column types when known (the single-RETURNING fallback); otherwise types come by name.
+fn last_result(
+  messages: &[SimpleQueryMessage],
+  types: Option<&[String]>,
   limits: &Limits,
-  guards: Guards,
-) -> Result<Rows, DbError> {
-  let deadline = session.deadline;
-  let err =
-    |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);
-  let mut tx = begin(session, true, guards)?;
-  let stmt = tx.prepare(body).map_err(err)?;
-  let columns = columns_of(&stmt);
-  let types: Vec<String> = stmt
-    .columns()
-    .iter()
-    .map(|c| c.type_().name().to_string())
-    .collect();
-  let mut sink = Sink::new(types, limits);
-  if is_cursor_statement(shape) {
-    tx.execute(
-      &format!("DECLARE {CURSOR} NO SCROLL CURSOR FOR {body}") as &str,
-      &[],
-    )
-    .map_err(err)?;
-    fetch_cursor(&mut tx, &mut sink).map_err(err)?;
-  } else {
-    let rows = tx.query_raw(&stmt, no_params()).map_err(err)?;
-    stream_text_rows(rows, &mut sink, false).map_err(err)?;
+) -> (Rows, u64) {
+  let mut best: Option<Rows> = None;
+  let mut cur_cols: Vec<Column> = Vec::new();
+  let mut sink: Option<Sink> = None;
+  let mut affected = 0u64;
+  for message in messages {
+    match message {
+      SimpleQueryMessage::RowDescription(desc) => {
+        cur_cols = desc
+          .iter()
+          .map(|c| Column {
+            name: c.name().to_string(),
+            decl_type: None,
+          })
+          .collect();
+        let cur_types: Vec<String> = match types {
+          Some(t) => t.to_vec(),
+          None => vec!["text".to_string(); desc.len()],
+        };
+        if let Some(t) = types {
+          for (col, name) in cur_cols.iter_mut().zip(t) {
+            col.decl_type = Some(name.clone());
+          }
+        }
+        sink = Some(Sink::new(cur_types, limits));
+      }
+      SimpleQueryMessage::Row(row) => {
+        if let Some(s) = sink.as_mut() {
+          let texts: Vec<Option<&str>> = (0..row.len()).map(|i| row.get(i)).collect();
+          s.push(&texts);
+        }
+      }
+      SimpleQueryMessage::CommandComplete(n) => {
+        affected = *n;
+        if let Some(s) = sink.take() {
+          best = Some(Rows {
+            columns: cur_cols.clone(),
+            rows: s.rows,
+            truncated_by: s.truncated_by,
+          });
+        }
+      }
+      _ => {}
+    }
   }
-  tx.rollback().map_err(err)?;
-  Ok(sink.finish(columns))
+  let rows = best.unwrap_or(Rows {
+    columns: Vec::new(),
+    rows: Vec::new(),
+    truncated_by: None,
+  });
+  let affected = if rows.rows.is_empty() { affected } else { 0 };
+  (rows, affected)
 }
 
 fn relkind(kind: &str) -> &'static str {
@@ -247,89 +186,77 @@ fn relkind(kind: &str) -> &'static str {
 }
 
 impl Backend for Postgres {
-  fn query(&self, sql: &str, limits: &Limits) -> Result<Rows, DbError> {
-    self.query_with(sql, limits, Guards::ALL)
-  }
-
-  fn exec(&self, sql: &str, limits: &Limits, create: bool) -> Result<ExecOutcome, DbError> {
-    if create {
-      return Err(DbError::new(
-        ErrorCode::ValidationError,
-        "CREATE_NOT_SUPPORTED",
-        "create applies to SQLite files; PostgreSQL databases are created on the server",
-      ));
-    }
-    let shape = classify::single_statement(sql)?;
-    classify::check_exec(&shape)?;
-    let (a, b) = shape.body();
-    let body = &sql[a..b];
+  fn run(&self, sql: &str, limits: &Limits) -> Result<RunOutcome, DbError> {
     let mut session = connect(&self.dsn, limits)?;
+    session.apply_settings()?;
     let deadline = session.deadline;
     let err =
       |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);
-    let mut tx = begin(&mut session, false, Guards::ALL)?;
-    let stmt = tx.prepare(body).map_err(err)?;
-    let first = shape.first_word().unwrap_or_default().to_string();
-    let (rows_affected, returning) = if stmt.columns().is_empty() {
-      (tx.execute(&stmt, &[]).map_err(err)?, None)
-    } else {
-      let columns = columns_of(&stmt);
-      let types: Vec<String> = stmt
-        .columns()
-        .iter()
-        .map(|c| c.type_().name().to_string())
-        .collect();
-      let mut sink = Sink::new(types, limits);
-      let affected = if is_cursor_statement(&shape) {
-        tx.execute(
-          &format!("DECLARE {CURSOR} NO SCROLL CURSOR FOR {body}") as &str,
-          &[],
-        )
-        .map_err(err)?;
-        fetch_cursor(&mut tx, &mut sink).map_err(err)?;
-        0
-      } else if matches!(first.as_str(), "insert" | "update" | "delete" | "merge") {
-        // RETURNING rows as text, streamed: the statement becomes a top-level data-modifying CTE.
-        let aliases: Vec<String> = (1..=columns.len()).map(|i| format!("\"c{i}\"")).collect();
-        let casts: Vec<String> = aliases
-          .iter()
-          .map(|a| format!("lmsql_w.{a}::text"))
-          .collect();
-        let wrapped = format!(
-          "WITH lmsql_w({}) AS (\n{body}\n) SELECT {} FROM lmsql_w",
-          aliases.join(", "),
-          casts.join(", ")
-        );
-        let rows = tx.query_raw(&wrapped as &str, no_params()).map_err(err)?;
-        stream_text_rows(rows, &mut sink, true).map_err(err)?
-      } else if first == "with" {
-        // A WITH holding a data-modifying statement cannot be nested in another WITH: the
-        // simple protocol returns its rows as text (layer 1 and Parse both saw one statement).
-        let mut affected = 0;
-        for message in tx.simple_query(body).map_err(err)? {
-          match message {
-            SimpleQueryMessage::Row(row) => {
-              let texts: Vec<Option<&str>> = (0..row.len()).map(|i| row.get(i)).collect();
-              sink.push(&texts);
-            }
-            SimpleQueryMessage::CommandComplete(n) => affected = n,
-            _ => {}
+
+    // One statement the extended protocol accepts: prepare tells us its columns and types.
+    match session.client.prepare(sql) {
+      Ok(stmt) if stmt.columns().is_empty() => {
+        let affected = session.client.execute(&stmt, &[]).map_err(err)?;
+        Ok(RunOutcome {
+          rows: Rows {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated_by: None,
+          },
+          rows_affected: affected,
+          last_insert_rowid: None,
+        })
+      }
+      Ok(stmt) => {
+        let (cols, types) = columns(&stmt);
+        // Try a cursor so a huge result stops at the cap; a data-modifying statement
+        // (INSERT ... RETURNING, WITH ... INSERT) cannot be a cursor, so fall back.
+        let mut tx = session.client.transaction().map_err(err)?;
+        let declared = tx.batch_execute(&format!(
+          "DECLARE {CURSOR} NO SCROLL CURSOR WITHOUT HOLD FOR {sql}"
+        ));
+        match declared {
+          Ok(()) => {
+            let mut sink = Sink::new(types, limits);
+            let fetch = fetch_cursor(&mut tx, &mut sink);
+            let _ = tx.rollback();
+            fetch.map_err(err)?;
+            Ok(RunOutcome {
+              rows: Rows {
+                columns: cols,
+                rows: sink.rows,
+                truncated_by: sink.truncated_by,
+              },
+              rows_affected: 0,
+              last_insert_rowid: None,
+            })
+          }
+          Err(_) => {
+            let _ = tx.rollback();
+            // RETURNING or a data-modifying CTE: run it once, typed by the prepared columns.
+            let messages = session.client.simple_query(sql).map_err(err)?;
+            let (mut rows, affected) = last_result(&messages, Some(&types), limits);
+            rows.columns = cols;
+            Ok(RunOutcome {
+              rows,
+              rows_affected: affected,
+              last_insert_rowid: None,
+            })
           }
         }
-        affected
-      } else {
-        let rows = tx.query_raw(&stmt, no_params()).map_err(err)?;
-        stream_text_rows(rows, &mut sink, true).map_err(err)?;
-        0
-      };
-      (affected, Some(sink.finish(columns)))
-    };
-    tx.commit().map_err(err)?;
-    Ok(ExecOutcome {
-      rows_affected,
-      last_insert_rowid: None,
-      returning,
-    })
+      }
+      // Multi-statement text or a utility statement the extended protocol rejects: run the whole
+      // text over the simple protocol (autocommit, unless the text has its own BEGIN/COMMIT).
+      Err(_) => {
+        let messages = session.client.simple_query(sql).map_err(err)?;
+        let (rows, affected) = last_result(&messages, None, limits);
+        Ok(RunOutcome {
+          rows,
+          rows_affected: affected,
+          last_insert_rowid: None,
+        })
+      }
+    }
   }
 
   fn tables(
@@ -338,12 +265,13 @@ impl Backend for Postgres {
     limits: &Limits,
   ) -> Result<(Vec<TableEntry>, bool), DbError> {
     let mut session = connect(&self.dsn, limits)?;
+    session.apply_settings()?;
     let deadline = session.deadline;
     let err =
       |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);
-    let mut tx = begin(&mut session, true, Guards::ALL)?;
     let cap = limits.max_rows as i64 + 1;
-    let rows = tx
+    let rows = session
+      .client
       .query(
         "SELECT n.nspname, c.relname, c.relkind::text \
          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -355,7 +283,6 @@ impl Backend for Postgres {
         &[&schema, &cap],
       )
       .map_err(err)?;
-    tx.rollback().map_err(err)?;
     let truncated = rows.len() > limits.max_rows;
     let tables = rows
       .iter()
@@ -377,26 +304,24 @@ impl Backend for Postgres {
   ) -> Result<TableDescription, DbError> {
     let not_found = || {
       DbError::new(
-        ErrorCode::NotFound,
+        lmrust::server::ErrorCode::NotFound,
         "TABLE_NOT_FOUND",
         format!("no table or view named {table:?}"),
       )
     };
     let mut session = connect(&self.dsn, limits)?;
+    session.apply_settings()?;
     let deadline = session.deadline;
     let err =
       |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);
-    let mut tx = begin(&mut session, true, Guards::ALL)?;
     let found = match schema {
-      Some(schema) => tx.query_opt(
+      Some(schema) => session.client.query_opt(
         "SELECT c.oid, n.nspname, c.relname, c.relkind::text \
          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = $1::text AND c.relname = $2::text AND c.relkind IN ('r', 'p', 'v', 'm', 'f')",
         &[&schema, &table],
       ),
-      // to_regclass parses the name (schema.table, quoting, search_path) and returns NULL when
-      // there is no such relation; an invalid name is an error, reported as not found.
-      None => tx.query_opt(
+      None => session.client.query_opt(
         "SELECT c.oid, n.nspname, c.relname, c.relkind::text \
          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.oid = pg_catalog.to_regclass($1::text) AND c.relkind IN ('r', 'p', 'v', 'm', 'f')",
@@ -418,7 +343,8 @@ impl Backend for Postgres {
       return Err(not_found());
     };
     let oid: postgres::types::Oid = found.get(0);
-    let rows = tx
+    let rows = session
+      .client
       .query(
         "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, \
                 pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
@@ -431,7 +357,6 @@ impl Backend for Postgres {
         &[&oid],
       )
       .map_err(err)?;
-    tx.rollback().map_err(err)?;
     let columns = rows
       .iter()
       .enumerate()

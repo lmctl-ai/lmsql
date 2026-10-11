@@ -6,8 +6,8 @@
 
 mod support;
 
-use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use serde_json::Value;
+use std::path::PathBuf;
 use support::*;
 
 fn root() -> PathBuf {
@@ -84,7 +84,7 @@ fn list_explain_and_op_help() {
     .collect();
   assert_eq!(names, ["query", "exec", "tables", "describe"]);
   let out = run(&["--explain", "exec"]);
-  assert_eq!(out.json()["access"], "write");
+  assert_eq!(out.json()["access"], "dynamic");
   let out = run(&["query", "--help"]);
   assert_eq!(out.code, 0);
   assert!(out.text().starts_with("lmsql query"), "{}", out.text());
@@ -121,84 +121,18 @@ fn fresh() -> (tempfile::TempDir, String) {
   (dir, s(&db))
 }
 
-fn tag_count(db: &str) -> i64 {
-  rusqlite::Connection::open(Path::new(db))
-    .unwrap()
-    .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
-    .unwrap()
-}
-
 #[test]
-fn exec_policy_confirm_dryrun_readonly() {
-  let delete = "DELETE FROM tags";
-  // (extra args, env, exit, envelope code or "ok"/"dry", rows left)
-  type Case<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>, i32, &'a str, i64);
-  let cases: Vec<Case> = vec![
-    (vec![], vec![], 9, "MISSING_CONFIRMATION", 3),
-    (vec!["--confirm"], vec![], 0, "ok", 0),
-    (vec!["--i-understand"], vec![], 0, "ok", 0),
-    (
-      vec!["--confirm=false"],
-      vec![],
-      9,
-      "MISSING_CONFIRMATION",
-      3,
-    ),
-    (vec!["--dryrun"], vec![], 0, "dry", 3),
-    (vec!["--dryrun", "--confirm"], vec![], 0, "dry", 3),
-    (
-      vec!["--readonly", "--confirm"],
-      vec![],
-      6,
-      "READONLY_VIOLATION",
-      3,
-    ),
-    (
-      vec!["--confirm"],
-      vec![("LMSQL_READONLY", "1")],
-      6,
-      "READONLY_VIOLATION",
-      3,
-    ),
-    (
-      vec!["--confirm", "--readonly=false"],
-      vec![("LMSQL_READONLY", "true")],
-      6,
-      "READONLY_VIOLATION",
-      3,
-    ),
-    (vec!["--confirm"], vec![("LMSQL_DRYRUN", "1")], 0, "dry", 3),
-  ];
-  for (extra, env, exit, expect, left) in cases {
-    let (_d, db) = fresh();
-    let mut args = vec!["exec", "--db", db.as_str(), delete];
-    args.extend(extra.iter());
-    let out = run_with(&args, &env, std::time::Duration::from_secs(20));
-    let doc = out.json();
-    assert_eq!(out.code, exit, "{extra:?} {env:?}: {doc}");
-    match expect {
-      "ok" => assert_eq!(doc["rows_affected"], 3, "{doc}"),
-      "dry" => assert_eq!(
-        (doc["dryRun"].clone(), doc["simulated"].clone()),
-        (json!(true), json!("exec"))
-      ),
-      code => assert_eq!(doc["error"]["code"], code, "{doc}"),
-    }
-    assert_eq!(tag_count(&db), left, "{extra:?} {env:?}");
-    // The dry-run result never echoes the database path.
-    assert!(!out.text().contains(&db), "{extra:?} leaked the path");
-  }
-}
-
-#[test]
-fn read_ops_run_under_readonly_and_dryrun() {
+fn open_mode_runs_writes_with_no_confirmation_and_ignores_readonly() {
   let (_d, db) = fresh();
-  for flag in ["--readonly", "--dryrun"] {
-    let out = run(&["query", "--db", &db, "SELECT count(*) FROM tags", flag]);
-    assert_eq!(out.json()["rows"], json!([[3]]), "{flag}");
-    let out = run(&["tables", "--db", &db, flag]);
-    assert_eq!(out.code, 0, "{flag}");
-  }
+  // No --confirm needed; the write just runs (access is "dynamic").
+  let out = run(&["exec", "--db", &db, "DELETE FROM tags"]);
+  assert_eq!(out.code, 0, "{}", out.text());
+  assert_eq!(out.json()["rows_affected"], 3);
+  // --readonly is still an accepted global but does not block a write in open mode.
+  let (_d, db) = fresh();
+  let out = run(&["exec", "--db", &db, "DELETE FROM tags", "--readonly"]);
+  assert_eq!(out.code, 0, "{}", out.text());
+  assert_eq!(out.json()["rows_affected"], 3);
 }
 
 #[test]
