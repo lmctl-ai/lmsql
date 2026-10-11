@@ -4,6 +4,7 @@
 
 use crate::backend::Target;
 use crate::error::DbError;
+use crate::settings::{Driver, Level, Login, Settings};
 use lmrust::server::ErrorCode;
 use std::path::PathBuf;
 
@@ -101,6 +102,223 @@ pub fn parse_dsn(name: &str, value: &str) -> Result<Target, DbError> {
     ));
   }
   Ok(Target::Sqlite(PathBuf::from(value)))
+}
+
+/// What the settings allow on the resolved connection, and what a denial must say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+  pub level: Level,
+  /// The settings connection (`None` without a settings file, or for an allowed `--db`).
+  pub rule: Option<Rule>,
+}
+
+/// Where the level came from: for the denial message and the operator's manual command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+  pub connection: String,
+  pub settings: PathBuf,
+  pub manual: Manual,
+}
+
+/// How the operator reaches the database with the original client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Manual {
+  /// `sqlite3 <path as written in the settings file>`.
+  Sqlite(String),
+  /// `psql "$VAR"` (the variable name only).
+  PsqlEnv(String),
+  /// The DSN is written in the settings file: a placeholder, never the value.
+  PsqlLiteral,
+}
+
+/// What the denied call wanted to do, for the manual command.
+#[derive(Debug, Clone, Copy)]
+pub enum Intent<'a> {
+  Sql(&'a str),
+  Tables,
+  Describe(&'a str),
+}
+
+/// POSIX shell single-quoting.
+pub fn shell_quote(text: &str) -> String {
+  format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+impl Access {
+  /// No settings file, or `--db` allowed by `allow_direct`: what the database allows.
+  pub fn open() -> Access {
+    Access {
+      level: Level::ReadWrite,
+      rule: None,
+    }
+  }
+
+  /// The operator's equivalent command for `intent`.
+  pub fn manual_command(&self, intent: Intent<'_>) -> Option<String> {
+    let rule = self.rule.as_ref()?;
+    Some(match &rule.manual {
+      Manual::Sqlite(written) => {
+        let path = match written.strip_prefix("~/") {
+          Some(rest) => format!("~/{}", shell_quote(rest)),
+          None => shell_quote(written),
+        };
+        let arg = match intent {
+          Intent::Sql(sql) => sql.to_string(),
+          Intent::Tables => ".tables".to_string(),
+          Intent::Describe(table) => format!(".schema {table}"),
+        };
+        format!("sqlite3 {path} {}", shell_quote(&arg))
+      }
+      Manual::PsqlEnv(_) | Manual::PsqlLiteral => {
+        let target = match &rule.manual {
+          Manual::PsqlEnv(var) => format!("\"${var}\""),
+          _ => shell_quote(&format!(
+            "<the dsn of connection {} in {}>",
+            rule.connection,
+            rule.settings.display()
+          )),
+        };
+        let arg = match intent {
+          Intent::Sql(sql) => sql.to_string(),
+          Intent::Tables => "\\dt".to_string(),
+          Intent::Describe(table) => format!("\\d {table}"),
+        };
+        format!("psql {target} -c {}", shell_quote(&arg))
+      }
+    })
+  }
+
+  /// The one short denial: FORBIDDEN / PERMISSION_DENIED, naming the connection, the rule and the
+  /// settings file, with the operator's manual command in the error data.
+  pub fn denied(&self, intent: Intent<'_>) -> DbError {
+    let (connection, settings) = match &self.rule {
+      Some(r) => (r.connection.as_str(), r.settings.display().to_string()),
+      None => ("?", "?".to_string()),
+    };
+    let what = match intent {
+      Intent::Sql(_) if self.level == Level::ReadOnly => "it does not allow writes",
+      _ => "it allows no access",
+    };
+    let mut err = DbError::new(
+      ErrorCode::Forbidden,
+      "PERMISSION_DENIED",
+      format!(
+        "permission denied: connection {connection:?} is {} (permissions.default in {settings}); {what}",
+        self.level.as_str()
+      ),
+    );
+    err.manual_command = self.manual_command(intent);
+    err
+  }
+
+  /// A write refused by the read-only open / READ ONLY transaction of a `readonly` connection is
+  /// a permission denial; anything else passes through unchanged.
+  pub fn map_error(&self, e: DbError, intent: Intent<'_>) -> DbError {
+    let refused_write = matches!(
+      e.tool_code.as_str(),
+      "SQLITE_READONLY" | "PG_25006" | "PG_42501"
+    );
+    if self.level == Level::ReadOnly && self.rule.is_some() && refused_write {
+      self.denied(intent)
+    } else {
+      e
+    }
+  }
+}
+
+/// Resolve the target of one call under `settings`. Without a settings file this is [`resolve`]
+/// (today's behavior). With one: `--connection` resolves only through the file (no
+/// `LMSQL_<NAME>` fallback), and `--db` needs `"allow_direct": true`.
+pub fn resolve_with(
+  db: Option<&str>,
+  connection: Option<&str>,
+  settings: &Settings,
+  lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(Target, Access), DbError> {
+  let Some(file) = &settings.source else {
+    return Ok((resolve(db, connection, lookup)?, Access::open()));
+  };
+  match (db, connection) {
+    (Some(_), None) if !settings.allow_direct => Err(DbError::new(
+      ErrorCode::Forbidden,
+      "DIRECT_NOT_ALLOWED",
+      format!(
+        "db (a direct path or DSN) is not allowed by the settings file {}; use connection NAME \
+         (the operator can set \"allow_direct\": true)",
+        file.display()
+      ),
+    )),
+    (Some(_), None) | (Some(_), Some(_)) | (None, None) => {
+      Ok((resolve(db, connection, lookup)?, Access::open()))
+    }
+    (None, Some(name)) => {
+      let conn = settings.connections.get(name).ok_or_else(|| {
+        DbError::new(
+          ErrorCode::NotFound,
+          "CONNECTION_NOT_FOUND",
+          format!(
+            "connection {name:?} is not in the settings file {}",
+            file.display()
+          ),
+        )
+      })?;
+      let rule = |manual| Rule {
+        connection: name.to_string(),
+        settings: file.clone(),
+        manual,
+      };
+      match &conn.driver {
+        Driver::Sqlite { written, path } => Ok((
+          Target::Sqlite(path.clone()),
+          Access {
+            level: conn.default,
+            rule: Some(rule(Manual::Sqlite(written.clone()))),
+          },
+        )),
+        Driver::Postgres {
+          readonly,
+          readwrite,
+        } => {
+          // readonly: the readonly login if there is one (else the readwrite login, with every
+          // transaction READ ONLY); readwrite: the readwrite login, or the only one.
+          let login = match conn.default {
+            Level::ReadOnly => readonly.as_ref().or(readwrite.as_ref()),
+            _ => readwrite.as_ref().or(readonly.as_ref()),
+          }
+          .expect("a postgres connection has a login");
+          let operator_login = readwrite.as_ref().or(readonly.as_ref()).expect("a login");
+          let manual = match operator_login {
+            Login::Env(var) => Manual::PsqlEnv(var.clone()),
+            Login::Literal(_) => Manual::PsqlLiteral,
+          };
+          let access = Access {
+            level: conn.default,
+            rule: Some(rule(manual)),
+          };
+          if conn.default == Level::None {
+            // Never connects; no DSN needed.
+            return Ok((Target::Postgres(String::new()), access));
+          }
+          let dsn = match login {
+            Login::Literal(dsn) => dsn.clone(),
+            Login::Env(var) => lookup(var)
+              .filter(|v| !v.trim().is_empty())
+              .ok_or_else(|| {
+                DbError::new(
+                  ErrorCode::NotFound,
+                  "CONNECTION_NOT_FOUND",
+                  format!(
+                    "connection {name:?}: environment variable {var} (named in {}) is not set",
+                    file.display()
+                  ),
+                )
+              })?,
+          };
+          Ok((Target::Postgres(dsn.trim().to_string()), access))
+        }
+      }
+    }
+  }
 }
 
 #[cfg(test)]

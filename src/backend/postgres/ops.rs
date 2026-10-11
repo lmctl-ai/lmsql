@@ -135,7 +135,7 @@ fn relkind(kind: &str) -> &'static str {
 impl Backend for Postgres {
   fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError> {
     let mut session = connect(&self.dsn, limits)?;
-    session.apply_settings()?;
+    session.apply_settings(self.read_only)?;
     let deadline = session.deadline;
     let err = move |e: postgres::Error| {
       super::errors::from_pg(e, false, std::time::Instant::now() >= deadline)
@@ -186,7 +186,7 @@ impl Backend for Postgres {
     limits: &Limits,
   ) -> Result<(Vec<TableEntry>, bool), DbError> {
     let mut session = connect(&self.dsn, limits)?;
-    session.apply_settings()?;
+    session.apply_settings(self.read_only)?;
     let deadline = session.deadline;
     let err =
       |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);
@@ -231,7 +231,7 @@ impl Backend for Postgres {
       )
     };
     let mut session = connect(&self.dsn, limits)?;
-    session.apply_settings()?;
+    session.apply_settings(self.read_only)?;
     let deadline = session.deadline;
     let err =
       |e: postgres::Error| super::errors::from_pg(e, false, std::time::Instant::now() >= deadline);

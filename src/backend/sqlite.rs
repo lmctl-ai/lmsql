@@ -46,11 +46,24 @@ fn wait_until_deadline(_attempt: i32) -> bool {
 
 pub struct Sqlite {
   path: PathBuf,
+  /// Settings level `readonly`: opened `SQLITE_OPEN_READ_ONLY` (never created) with
+  /// `PRAGMA query_only = ON`.
+  read_only: bool,
 }
 
 impl Sqlite {
   pub fn new(path: PathBuf) -> Self {
-    Sqlite { path }
+    Sqlite {
+      path,
+      read_only: false,
+    }
+  }
+
+  pub fn read_only(path: PathBuf) -> Self {
+    Sqlite {
+      path,
+      read_only: true,
+    }
   }
 }
 
@@ -66,15 +79,23 @@ pub fn literal_path(path: &Path) -> PathBuf {
   }
 }
 
-/// Open the database read-write (creating the file if missing); start the call's deadline.
-pub fn open(path: &Path, limits: &Limits) -> Result<Connection, DbError> {
+/// Open the database — read-write (creating the file if missing), or for `read_only` read-only
+/// with `query_only` — and start the call's deadline.
+pub fn open(path: &Path, limits: &Limits, read_only: bool) -> Result<Connection, DbError> {
   let path = literal_path(path);
   let deadline = Instant::now() + limits.timeout;
   DEADLINE.with(|d| d.set(Some(deadline)));
-  let flags = OpenFlags::SQLITE_OPEN_NO_MUTEX
-    | OpenFlags::SQLITE_OPEN_READ_WRITE
-    | OpenFlags::SQLITE_OPEN_CREATE;
+  let flags = if read_only {
+    OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY
+  } else {
+    OpenFlags::SQLITE_OPEN_NO_MUTEX
+      | OpenFlags::SQLITE_OPEN_READ_WRITE
+      | OpenFlags::SQLITE_OPEN_CREATE
+  };
   let conn = Connection::open_with_flags(&path, flags)?;
+  if read_only {
+    conn.pragma_update(None, "query_only", true)?;
+  }
   conn.busy_handler(Some(wait_until_deadline))?;
   conn.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() >= deadline));
   Ok(conn)
@@ -123,7 +144,7 @@ fn run_batch(conn: &Connection, sql: &str, sink: &mut Sink) -> Result<(), DbErro
 
 impl Backend for Sqlite {
   fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError> {
-    let conn = open(&self.path, limits)?;
+    let conn = open(&self.path, limits, self.read_only)?;
     run_batch(&conn, sql, sink)?;
     Ok(RunStats {
       rows_affected: conn.changes(),
@@ -136,7 +157,7 @@ impl Backend for Sqlite {
     schema: Option<&str>,
     limits: &Limits,
   ) -> Result<(Vec<TableEntry>, bool), DbError> {
-    let conn = open(&self.path, limits)?;
+    let conn = open(&self.path, limits, self.read_only)?;
     // SQLite's attached schema name; `main` by default.
     let db = schema.unwrap_or("main");
     let mut stmt = conn.prepare(&format!(
@@ -168,7 +189,7 @@ impl Backend for Sqlite {
     table: &str,
     limits: &Limits,
   ) -> Result<TableDescription, DbError> {
-    let conn = open(&self.path, limits)?;
+    let conn = open(&self.path, limits, self.read_only)?;
     let found: Option<(String, String)> = conn
       .prepare(
         "SELECT name, type FROM sqlite_schema \

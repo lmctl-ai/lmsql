@@ -20,10 +20,14 @@ pub enum Target {
 }
 
 impl Target {
-  pub fn backend(&self) -> Box<dyn Backend> {
-    match self {
-      Target::Sqlite(path) => Box::new(sqlite::Sqlite::new(path.clone())),
-      Target::Postgres(dsn) => Box::new(postgres::Postgres::new(dsn.clone())),
+  /// The backend; `read_only` (settings level `readonly`) opens SQLite read-only with
+  /// `query_only`, and starts every PostgreSQL transaction READ ONLY.
+  pub fn backend(&self, read_only: bool) -> Box<dyn Backend> {
+    match (self, read_only) {
+      (Target::Sqlite(path), false) => Box::new(sqlite::Sqlite::new(path.clone())),
+      (Target::Sqlite(path), true) => Box::new(sqlite::Sqlite::read_only(path.clone())),
+      (Target::Postgres(dsn), false) => Box::new(postgres::Postgres::new(dsn.clone())),
+      (Target::Postgres(dsn), true) => Box::new(postgres::Postgres::read_only(dsn.clone())),
     }
   }
 

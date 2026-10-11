@@ -7,6 +7,7 @@ pub mod error;
 pub mod legacy;
 pub mod output;
 pub mod policy;
+pub mod settings;
 pub mod spec;
 pub mod values;
 

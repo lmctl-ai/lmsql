@@ -24,11 +24,25 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub struct Postgres {
   dsn: String,
+  /// Settings level `readonly`: every transaction of the session starts READ ONLY.
+  read_only: bool,
 }
 
 impl Postgres {
   pub fn new(dsn: String) -> Self {
-    Postgres { dsn }
+    Postgres {
+      dsn,
+      read_only: false,
+    }
+  }
+
+  /// A session whose transactions are all READ ONLY (`default_transaction_read_only`). SQL can
+  /// change that setting again, so this is weaker than a read-only database role.
+  pub fn read_only(dsn: String) -> Self {
+    Postgres {
+      dsn,
+      read_only: true,
+    }
   }
 }
 
@@ -68,14 +82,17 @@ impl Session {
 
   /// Pin the session's timeouts (from the remaining time) and output formats so values parse the
   /// same on every server. Session-level `SET` (not `SET LOCAL`): the process runs one call.
-  pub fn apply_settings(&mut self) -> Result<(), DbError> {
+  pub fn apply_settings(&mut self, read_only: bool) -> Result<(), DbError> {
     let ms = self.remaining_ms();
-    let setup = format!(
+    let mut setup = format!(
       "SET statement_timeout = {ms}; SET lock_timeout = {ms}; \
        SET idle_in_transaction_session_timeout = {ms}; \
        SET TimeZone = 'UTC'; SET DateStyle = 'ISO, YMD'; SET IntervalStyle = 'iso_8601'; \
        SET bytea_output = 'hex'; SET extra_float_digits = '3'"
     );
+    if read_only {
+      setup.push_str("; SET default_transaction_read_only = on");
+    }
     let passed = self.deadline_passed();
     self
       .client
