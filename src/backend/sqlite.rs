@@ -12,7 +12,9 @@
 //! A `file:` name is made a literal path (the bundled SQLite is built with `SQLITE_USE_URI`), so a
 //! name is never reinterpreted as a URI with its own parameters.
 
-use super::{Backend, Column, ColumnInfo, Mode, RunStats, TableDescription, TableEntry};
+use super::{
+  Backend, Column, ColumnInfo, DryRun, Mode, Planned, RunStats, TableDescription, TableEntry,
+};
 use crate::error::DbError;
 use crate::output::Sink;
 use crate::settings::{Level, TableRules};
@@ -227,6 +229,60 @@ impl Backend for Sqlite {
     })
   }
 
+  fn dry_run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<DryRun, DbError> {
+    let (conn, denied) = self.connect(limits)?;
+    // Prepare every statement (preparing runs nothing) and ask SQLite whether it writes.
+    let mut statements: Vec<(String, bool)> = Vec::new();
+    let mut incomplete = false;
+    {
+      let mut batch = Batch::new(&conn, sql);
+      loop {
+        match batch.next() {
+          Ok(Some(stmt)) => {
+            let text = stmt.expanded_sql().unwrap_or_default();
+            let text = text.trim().trim_end_matches(';').trim_end().to_string();
+            statements.push((text, !stmt.readonly()));
+          }
+          Ok(None) => break,
+          // A later statement may need an earlier change that a dry run does not make.
+          Err(e) => {
+            let e = denied.mark(e.into());
+            if e.denied_table.is_some() || !statements.iter().any(|(_, w)| *w) {
+              return Err(e);
+            }
+            incomplete = true;
+            break;
+          }
+        }
+      }
+    }
+    if !statements.iter().any(|(_, write)| *write) {
+      run_batch(&conn, sql, sink).map_err(|e| denied.mark(e))?;
+      return Ok(DryRun::Read(RunStats {
+        rows_affected: conn.changes(),
+        last_insert_rowid: Some(conn.last_insert_rowid()),
+      }));
+    }
+    let mut planned: Vec<Planned> = statements
+      .into_iter()
+      .map(|(statement, would_change)| Planned {
+        plan: query_plan(&conn, &statement),
+        statement,
+        would_change,
+        estimated_rows: None,
+      })
+      .collect();
+    if incomplete {
+      planned.push(Planned {
+        statement: "(the remaining statements need the changes above and were not checked)".into(),
+        would_change: true,
+        plan: Value::Null,
+        estimated_rows: None,
+      });
+    }
+    Ok(DryRun::WouldChange(planned))
+  }
+
   fn tables(
     &self,
     schema: Option<&str>,
@@ -307,6 +363,19 @@ impl Backend for Sqlite {
   }
 }
 
+/// `EXPLAIN QUERY PLAN` details of one statement (best effort; `null` when SQLite gives none).
+fn query_plan(conn: &Connection, statement: &str) -> Value {
+  let plan = (|| -> rusqlite::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {statement}"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+    rows.map(|r| r.map(Value::String)).collect()
+  })();
+  match plan {
+    Ok(lines) if !lines.is_empty() => Value::Array(lines),
+    _ => Value::Null,
+  }
+}
+
 /// Double-quote a SQLite identifier (for the schema name in `tables`).
 fn quote_ident(name: &str) -> String {
   format!("\"{}\"", name.replace('"', "\"\""))
@@ -331,7 +400,8 @@ mod tests {
   }
 
   fn run(db: &Sqlite, sql: &str, inline_rows: usize) -> (Collected, RunStats) {
-    let mut sink = Sink::new(OutputConfig::new(None, None, inline_rows, 1 << 20, false).unwrap());
+    let mut sink =
+      Sink::new(OutputConfig::new(None, None, inline_rows, 1 << 20, false, false).unwrap());
     let stats = db.run(sql, &Limits::default(), &mut sink).unwrap();
     (sink.finish().unwrap(), stats)
   }
