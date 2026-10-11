@@ -22,7 +22,8 @@ pub const HARD_MAX_BYTES: u64 = 16 << 20;
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const HARD_TIMEOUT_MS: u64 = 300_000;
 
-/// Caps for one call. `max_bytes` bounds the serialized `rows` array.
+/// Thresholds for one call: `max_rows` / `max_bytes` decide inline vs. file (`crate::output`);
+/// `timeout` is the deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
   pub max_rows: usize,
@@ -90,30 +91,10 @@ pub fn to_json(value: rusqlite::types::ValueRef<'_>) -> Value {
   }
 }
 
-/// A lower bound of the serialized size of `value` (exact for numbers and plain ASCII text),
-/// computed without encoding: huge values are refused before they are copied.
-pub fn min_json_len(value: rusqlite::types::ValueRef<'_>) -> usize {
-  use rusqlite::types::ValueRef;
-  match value {
-    ValueRef::Null => 4,
-    ValueRef::Integer(_) | ValueRef::Real(_) => 1,
-    ValueRef::Text(bytes) => bytes.len() + 2,
-    ValueRef::Blob(bytes) => bytes.len().div_ceil(3) * 4 + 19, // {"$blob_base64":"..."}
-  }
-}
-
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-#[cfg(test)]
-thread_local! {
-  /// Bytes base64-encoded on this thread (tests prove huge values are refused before encoding).
-  pub static ENCODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 /// Standard padded base64 (RFC 4648 section 4).
 pub fn base64(bytes: &[u8]) -> String {
-  #[cfg(test)]
-  ENCODED_BYTES.with(|n| n.set(n.get() + bytes.len()));
   let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
   for chunk in bytes.chunks(3) {
     let b = [
@@ -174,23 +155,6 @@ mod tests {
       json!({"$blob_base64": "AQID"})
     );
     assert_eq!(to_json(ValueRef::Blob(&[])), json!({"$blob_base64": ""}));
-  }
-
-  #[test]
-  fn min_len_never_exceeds_the_real_length() {
-    for v in [
-      ValueRef::Null,
-      ValueRef::Integer(7),
-      ValueRef::Real(0.5),
-      ValueRef::Text(b"abc"),
-      ValueRef::Text(b"a\0\"b"),
-      ValueRef::Blob(&[1, 2, 3, 4]),
-    ] {
-      assert!(
-        min_json_len(v) <= serde_json::to_string(&to_json(v)).unwrap().len(),
-        "{v:?}"
-      );
-    }
   }
 
   #[test]

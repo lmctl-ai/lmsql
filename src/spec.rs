@@ -3,6 +3,7 @@
 use crate::backend::{Backend, Target};
 use crate::connection;
 use crate::error::DbError;
+use crate::output::{Format, OutputConfig, Sink, DEFAULT_PREVIEW_ROWS};
 use crate::policy::Policy as OpenPolicy;
 use crate::values::{
   Limits, DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_MS, HARD_MAX_BYTES, HARD_MAX_ROWS,
@@ -17,7 +18,7 @@ pub const TOOL: &str = "lmsql";
 fn db_param() -> ParamSpec {
   ParamSpec::new("db", ParamType::String)
     .optional()
-    .describe("Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection")
+    .describe("Path of a SQLite database file, or a postgres:// DSN (prefer connection for DSNs: argv is visible to other users)")
 }
 
 fn connection_param() -> ParamSpec {
@@ -35,15 +36,15 @@ fn schema_param() -> ParamSpec {
 fn statement_param(what: &str) -> ParamSpec {
   ParamSpec::new("statement", ParamType::String)
     .positional()
-    .describe(format!("Exactly one SQL statement ({what})"))
+    .describe(format!("SQL to run ({what})"))
 }
 
 fn max_rows_param() -> ParamSpec {
+  // No declared default: whether maxRows was given decides the preview size of a file response.
   ParamSpec::new("maxRows", ParamType::Number)
     .optional()
-    .with_default(json!(DEFAULT_MAX_ROWS))
     .describe(format!(
-      "Return at most this many rows (1..{HARD_MAX_ROWS}); more set truncated: true"
+      "Inline threshold (1..{HARD_MAX_ROWS}, default {DEFAULT_MAX_ROWS}): a result with more rows is written in full to a file (spilled: true) instead of inline; in a file response, the preview size (default {DEFAULT_PREVIEW_ROWS})"
     ))
 }
 
@@ -52,8 +53,30 @@ fn max_bytes_param() -> ParamSpec {
     .optional()
     .with_default(json!(DEFAULT_MAX_BYTES))
     .describe(format!(
-      "Cap on the serialized rows in bytes (1..{HARD_MAX_BYTES}); hitting it sets truncated: true"
+      "Inline threshold in serialized bytes (1..{HARD_MAX_BYTES}): a bigger result is written in full to a file instead of inline"
     ))
+}
+
+fn list_max_rows_param() -> ParamSpec {
+  ParamSpec::new("maxRows", ParamType::Number)
+    .optional()
+    .with_default(json!(DEFAULT_MAX_ROWS))
+    .describe(format!(
+      "List at most this many tables (1..{HARD_MAX_ROWS}); more set truncated: true"
+    ))
+}
+
+fn out_param() -> ParamSpec {
+  ParamSpec::new("out", ParamType::String)
+    .optional()
+    .describe("Write the full result to this file (streamed; replaced atomically; parent directories created) and return a summary with a preview")
+}
+
+fn out_format_param() -> ParamSpec {
+  ParamSpec::new("outFormat", ParamType::String)
+    .optional()
+    .with_enum(Format::NAMES.iter().map(|n| json!(n)))
+    .describe("Format of the out file: ndjson (one JSON object per row), csv (RFC 4180, header row) or json (one array); default from the out extension, else ndjson")
 }
 
 fn timeout_param() -> ParamSpec {
@@ -94,6 +117,8 @@ pub fn schemas() -> Vec<OperationSchema> {
         connection_param(),
         max_rows_param(),
         max_bytes_param(),
+        out_param(),
+        out_format_param(),
         timeout_param(),
       ],
     ),
@@ -107,6 +132,8 @@ pub fn schemas() -> Vec<OperationSchema> {
         connection_param(),
         max_rows_param(),
         max_bytes_param(),
+        out_param(),
+        out_format_param(),
         timeout_param(),
       ],
     ),
@@ -114,7 +141,7 @@ pub fn schemas() -> Vec<OperationSchema> {
       "tables",
       Access::Read,
       "List tables and views (internal sqlite_* objects excluded)",
-      vec![db_param(), connection_param(), schema_param(), max_rows_param(), timeout_param()],
+      vec![db_param(), connection_param(), schema_param(), list_max_rows_param(), timeout_param()],
     ),
     schema(
       "describe",
@@ -178,7 +205,17 @@ fn run_sql(op: &str, params: &Record) -> Result<Value, CliError> {
   let sql = statement(params).to_string();
   with_backend(params, |b, l| {
     OpenPolicy::load().allow(op, &sql)?;
-    b.run(&sql, l).map(|r| r.to_json())
+    // Checked before the SQL runs: a bad out path must not follow a committed write.
+    let config = OutputConfig::new(
+      text(params, "out"),
+      text(params, "outFormat"),
+      l.max_rows,
+      l.max_bytes,
+      params.contains_key("maxRows"),
+    )?;
+    let mut sink = Sink::new(config);
+    let stats = b.run(&sql, l, &mut sink)?;
+    Ok(sink.finish()?.to_json(&stats))
   })
 }
 

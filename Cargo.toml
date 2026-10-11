@@ -25,8 +25,20 @@ tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 
+[target.'cfg(unix)'.dependencies]
+# geteuid: the default spill directory must belong to the current user.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
+
+# Dev/test builds are optimized (SQLite's C code, serde_json and the generic code instantiated in
+# lmsql), so the multi-million-row streaming tests run in seconds. Debug info is kept.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = true

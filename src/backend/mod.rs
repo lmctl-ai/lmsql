@@ -5,6 +5,7 @@ pub mod postgres;
 pub mod sqlite;
 
 use crate::error::DbError;
+use crate::output::Sink;
 use crate::values::Limits;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -52,57 +53,13 @@ pub struct Column {
   pub decl_type: Option<String>,
 }
 
-/// Rows of a statement, capped by [`Limits`]. `truncated_by` says which cap stopped it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Rows {
-  pub columns: Vec<Column>,
-  pub rows: Vec<Vec<Value>>,
-  pub truncated_by: Option<&'static str>,
-}
-
-impl Rows {
-  pub fn to_json(&self) -> Value {
-    json!({
-      "columns": self
-        .columns
-        .iter()
-        .map(|c| json!({"name": c.name, "type": c.decl_type}))
-        .collect::<Vec<_>>(),
-      "rows": self.rows,
-      "row_count": self.rows.len(),
-      "truncated": self.truncated_by.is_some(),
-      "truncated_by": self.truncated_by,
-    })
-  }
-}
-
-/// The result of running one request (`query` and `exec` are identical in open mode): the last
-/// statement's columns and rows (capped), plus how many rows it changed. One shape for both ops.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunOutcome {
-  pub rows: Rows,
+/// What a `query` / `exec` changed; the rows themselves go to the [`Sink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RunStats {
+  /// Rows changed by the last statement (PostgreSQL: its command tag count).
   pub rows_affected: u64,
   /// SQLite's last inserted rowid; `None` (JSON `null`) for PostgreSQL, which has none.
   pub last_insert_rowid: Option<i64>,
-}
-
-impl RunOutcome {
-  pub fn to_json(&self) -> Value {
-    json!({
-      "columns": self
-        .rows
-        .columns
-        .iter()
-        .map(|c| json!({"name": c.name, "type": c.decl_type}))
-        .collect::<Vec<_>>(),
-      "rows": self.rows.rows,
-      "row_count": self.rows.rows.len(),
-      "rows_affected": self.rows_affected,
-      "last_insert_rowid": self.last_insert_rowid,
-      "truncated": self.rows.truncated_by.is_some(),
-      "truncated_by": self.rows.truncated_by,
-    })
-  }
 }
 
 /// A table or view.
@@ -168,11 +125,12 @@ impl TableDescription {
 
 /// The operations every backend provides. In open mode a backend runs any SQL the database
 /// accepts (the earlier read-only guards are in git history on `phase2-postgres` / at 0a3877f);
-/// result size and time are still capped by [`Limits`].
+/// big results go to a file ([`crate::output`]); time is capped by [`Limits`].
 pub trait Backend {
-  /// Run the request's SQL and return the last statement's columns/rows plus rows changed.
-  /// `query` and `exec` both call this; they differ only in lmapi access level.
-  fn run(&self, sql: &str, limits: &Limits) -> Result<RunOutcome, DbError>;
+  /// Run the request's SQL, streaming each result set's rows into `sink` as they are fetched
+  /// (never all in memory), and return what the last statement changed. `query` and `exec` both
+  /// call this.
+  fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError>;
   /// Tables and views (internal objects excluded), capped by `limits.max_rows`; `schema` limits
   /// the list to one schema.
   fn tables(

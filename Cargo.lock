@@ -371,6 +371,7 @@ name = "lmsql"
 version = "0.2.0"
 dependencies = [
  "fallible-iterator 0.2.0",
+ "libc",
  "lmrust",
  "postgres",
  "rusqlite",

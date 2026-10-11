@@ -5,6 +5,7 @@ pub mod backend;
 pub mod connection;
 pub mod error;
 pub mod legacy;
+pub mod output;
 pub mod policy;
 pub mod spec;
 pub mod values;
