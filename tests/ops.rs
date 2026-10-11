@@ -373,3 +373,22 @@ fn pg_timeout_interrupts_pg_sleep() {
   );
   assert!(out.elapsed < Duration::from_secs(5), "{:?}", out.elapsed);
 }
+
+#[test]
+fn pg_sslmode_require_needs_tls_and_prefer_falls_back() {
+  let Some(url) = pg_url() else { return };
+  // The throwaway server has no TLS. sslmode=require must refuse to connect in cleartext.
+  let require = url.replace("sslmode=disable", "sslmode=require");
+  let out = pg_run(&require, &["query", "select 1"]);
+  assert_eq!(
+    (out.code, out.tool_code().as_str()),
+    (8, "CONNECT_FAILED"),
+    "{}",
+    out.text()
+  );
+  // The default (prefer, for a local server) connects over cleartext.
+  let prefer = url.replace("?sslmode=disable", "");
+  let out = pg_run(&prefer, &["query", "select 1"]);
+  assert_eq!(out.code, 0, "{}", out.text());
+  assert_eq!(out.json()["rows"], json!([[1]]));
+}
