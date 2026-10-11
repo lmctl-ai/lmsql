@@ -122,7 +122,7 @@ pub fn schemas() -> Vec<OperationSchema> {
     schema(
       "query",
       Access::Dynamic,
-      "Run SQL and return columns and rows as JSON (open mode: runs any statement the database accepts; identical to exec)",
+      "Run SQL and return columns and rows as JSON (open mode: runs any statement the database accepts; identical to exec). With --dry-run nothing that would change data is executed: reads run normally; otherwise the response is {dry_run, executed: false, would_change: true, statement}, plus plan / estimated_rows as best-effort extras that may be absent",
       vec![
         statement_param("any SQL; multiple statements run in order and the last one's rows are returned"),
         db_param(),
@@ -138,7 +138,7 @@ pub fn schemas() -> Vec<OperationSchema> {
     schema(
       "exec",
       Access::Dynamic,
-      "Run SQL and return rows plus rows_affected and last_insert_rowid (open mode: identical to query; both run any statement)",
+      "Run SQL and return rows plus rows_affected and last_insert_rowid (open mode: identical to query; both run any statement). With --dry-run nothing that would change data is executed: reads run normally; otherwise the response is {dry_run, executed: false, would_change: true, statement}, plus plan / estimated_rows as best-effort extras that may be absent",
       vec![
         statement_param("any SQL: INSERT, UPDATE, DELETE, CREATE, ...; RETURNING and SELECT rows are returned"),
         db_param(),
@@ -327,22 +327,26 @@ fn dry_run_result(
         "executed": false,
         "would_change": true,
         "statement": sql,
-        "plan": if single { planned[0].plan.clone() } else { Value::Null },
       });
-      if let Some(rows) = planned
-        .first()
-        .and_then(|p| p.estimated_rows)
-        .filter(|_| single)
-      {
-        out["estimated_rows"] = json!(rows);
-      }
-      if !single {
+      // Best-effort extras: present only when the database's own EXPLAIN gave them.
+      if single {
+        if let Some(plan) = &planned[0].plan {
+          out["plan"] = plan.clone();
+        }
+        if let Some(rows) = planned[0].estimated_rows {
+          out["estimated_rows"] = json!(rows);
+        }
+      } else {
         out["statements"] = Value::Array(
           planned
             .iter()
-            .map(
-              |p| json!({"statement": p.statement, "would_change": p.would_change, "plan": p.plan}),
-            )
+            .map(|p| {
+              let mut entry = json!({"statement": p.statement, "would_change": p.would_change});
+              if let Some(plan) = &p.plan {
+                entry["plan"] = plan.clone();
+              }
+              entry
+            })
             .collect(),
         );
       }

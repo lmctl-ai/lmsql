@@ -110,7 +110,7 @@
       "name": "query",
       "access": "dynamic",
       "returns": "object",
-      "description": "Run SQL and return columns and rows as JSON (open mode: runs any statement the database accepts; identical to exec)",
+      "description": "Run SQL and return columns and rows as JSON (open mode: runs any statement the database accepts; identical to exec). With --dry-run nothing that would change data is executed: reads run normally; otherwise the response is {dry_run, executed: false, would_change: true, statement}, plus plan / estimated_rows as best-effort extras that may be absent",
       "params": [
         {
           "name": "statement",
@@ -179,7 +179,7 @@
       "name": "exec",
       "access": "dynamic",
       "returns": "object",
-      "description": "Run SQL and return rows plus rows_affected and last_insert_rowid (open mode: identical to query; both run any statement)",
+      "description": "Run SQL and return rows plus rows_affected and last_insert_rowid (open mode: identical to query; both run any statement). With --dry-run nothing that would change data is executed: reads run normally; otherwise the response is {dry_run, executed: false, would_change: true, statement}, plus plan / estimated_rows as best-effort extras that may be absent",
       "params": [
         {
           "name": "statement",

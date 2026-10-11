@@ -276,7 +276,7 @@ impl Backend for Sqlite {
       planned.push(Planned {
         statement: "(the remaining statements need the changes above and were not checked)".into(),
         would_change: true,
-        plan: Value::Null,
+        plan: None,
         estimated_rows: None,
       });
     }
@@ -363,16 +363,17 @@ impl Backend for Sqlite {
   }
 }
 
-/// `EXPLAIN QUERY PLAN` details of one statement (best effort; `null` when SQLite gives none).
-fn query_plan(conn: &Connection, statement: &str) -> Value {
+/// `EXPLAIN QUERY PLAN` details of one statement: best effort, `None` on any failure or when
+/// SQLite gives none (preparing EXPLAIN runs nothing).
+fn query_plan(conn: &Connection, statement: &str) -> Option<Value> {
   let plan = (|| -> rusqlite::Result<Vec<Value>> {
     let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {statement}"))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
     rows.map(|r| r.map(Value::String)).collect()
   })();
   match plan {
-    Ok(lines) if !lines.is_empty() => Value::Array(lines),
-    _ => Value::Null,
+    Ok(lines) if !lines.is_empty() => Some(Value::Array(lines)),
+    _ => None,
   }
 }
 
