@@ -24,24 +24,21 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub struct Postgres {
   dsn: String,
-  /// Settings level `readonly`: every transaction of the session starts READ ONLY.
+  /// Settings level `readonly`: every transaction of the session starts READ ONLY
+  /// (`default_transaction_read_only`). SQL can change that setting again, so this is weaker
+  /// than a read-only database role.
   read_only: bool,
 }
 
 impl Postgres {
   pub fn new(dsn: String) -> Self {
-    Postgres {
-      dsn,
-      read_only: false,
-    }
+    Postgres::with_mode(dsn, crate::backend::Mode::default())
   }
 
-  /// A session whose transactions are all READ ONLY (`default_transaction_read_only`). SQL can
-  /// change that setting again, so this is weaker than a read-only database role.
-  pub fn read_only(dsn: String) -> Self {
+  pub fn with_mode(dsn: String, mode: crate::backend::Mode) -> Self {
     Postgres {
       dsn,
-      read_only: true,
+      read_only: mode.read_only,
     }
   }
 }

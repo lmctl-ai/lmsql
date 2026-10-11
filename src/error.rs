@@ -17,6 +17,9 @@ pub struct DbError {
   /// For a permission denial: the equivalent command the operator can run in their own shell
   /// (`error.data.manual_command`). Never holds a secret value.
   pub manual_command: Option<String>,
+  /// The table a SQLite per-table rule refused (set by the authorizer; turned into the
+  /// permission denial by `connection::Access::map_error`).
+  pub denied_table: Option<String>,
 }
 
 impl DbError {
@@ -28,6 +31,7 @@ impl DbError {
       offset: None,
       foreign: false,
       manual_command: None,
+      denied_table: None,
     }
   }
 

@@ -2,9 +2,10 @@
 //! the environment variable `LMSQL_<NAME>` (upper-cased). The value is a SQLite path or a DSN.
 //! Neither the path nor the DSN is ever echoed back: errors name the connection, not its value.
 
+use crate::backend::Mode;
 use crate::backend::Target;
 use crate::error::DbError;
-use crate::settings::{Driver, Level, Login, Settings};
+use crate::settings::{Driver, Level, Login, Settings, TableRules};
 use lmrust::server::ErrorCode;
 use std::path::PathBuf;
 
@@ -107,7 +108,10 @@ pub fn parse_dsn(name: &str, value: &str) -> Result<Target, DbError> {
 /// What the settings allow on the resolved connection, and what a denial must say.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Access {
+  /// The connection default (`permissions.default`).
   pub level: Level,
+  /// SQLite per-table levels (`permissions.tables`; empty otherwise).
+  pub tables: TableRules,
   /// The settings connection (`None` without a settings file, or for an allowed `--db`).
   pub rule: Option<Rule>,
 }
@@ -149,7 +153,27 @@ impl Access {
   pub fn open() -> Access {
     Access {
       level: Level::ReadWrite,
+      tables: TableRules::new(Level::ReadWrite, &Default::default()),
       rule: None,
+    }
+  }
+
+  /// The most any table on this connection allows (`none` = nothing at all is allowed).
+  pub fn max_level(&self) -> Level {
+    self.tables.max()
+  }
+
+  /// The level of one table.
+  pub fn level_of(&self, table: &str) -> Level {
+    self.tables.level(table)
+  }
+
+  /// How the database handle is restricted: read-only when no table allows writes; the
+  /// authorizer when some table rule differs from the default.
+  pub fn mode(&self) -> Mode {
+    Mode {
+      read_only: self.rule.is_some() && self.max_level() <= Level::ReadOnly,
+      table_rules: self.tables.any_rule().then(|| self.tables.clone()),
     }
   }
 
@@ -211,14 +235,50 @@ impl Access {
     err
   }
 
-  /// A write refused by the read-only open / READ ONLY transaction of a `readonly` connection is
-  /// a permission denial; anything else passes through unchanged.
+  /// The denial for a table rule: names the table, its level and where the rule is.
+  pub fn denied_table(&self, table: &str, intent: Intent<'_>) -> DbError {
+    let (connection, settings) = match &self.rule {
+      Some(r) => (r.connection.as_str(), r.settings.display().to_string()),
+      None => ("?", "?".to_string()),
+    };
+    let level = self.level_of(table);
+    let key = if self.tables.tables.contains_key(&table.to_lowercase()) {
+      format!("permissions.tables.{table}")
+    } else {
+      "permissions.default".to_string()
+    };
+    let what = if level == Level::ReadOnly {
+      "it does not allow writes"
+    } else {
+      "it allows no access"
+    };
+    let mut err = DbError::new(
+      ErrorCode::Forbidden,
+      "PERMISSION_DENIED",
+      format!(
+        "permission denied: table {table:?} is {} on connection {connection:?} ({key} in {settings}); {what}",
+        level.as_str()
+      ),
+    );
+    err.manual_command = self.manual_command(intent);
+    err
+  }
+
+  /// A table refused by the authorizer, or a write refused by the read-only open / READ ONLY
+  /// transaction of a `readonly` connection, is a permission denial; anything else passes through
+  /// unchanged.
   pub fn map_error(&self, e: DbError, intent: Intent<'_>) -> DbError {
+    if self.rule.is_none() {
+      return e;
+    }
+    if let Some(table) = &e.denied_table {
+      return self.denied_table(table, intent);
+    }
     let refused_write = matches!(
       e.tool_code.as_str(),
       "SQLITE_READONLY" | "PG_25006" | "PG_42501"
     );
-    if self.level == Level::ReadOnly && self.rule.is_some() && refused_write {
+    if self.max_level() == Level::ReadOnly && refused_write {
       self.denied(intent)
     } else {
       e
@@ -272,6 +332,7 @@ pub fn resolve_with(
           Target::Sqlite(path.clone()),
           Access {
             level: conn.default,
+            tables: TableRules::new(conn.default, &conn.tables),
             rule: Some(rule(Manual::Sqlite(written.clone()))),
           },
         )),
@@ -293,6 +354,7 @@ pub fn resolve_with(
           };
           let access = Access {
             level: conn.default,
+            tables: TableRules::new(conn.default, &Default::default()),
             rule: Some(rule(manual)),
           };
           if conn.default == Level::None {
