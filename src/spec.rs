@@ -12,7 +12,7 @@ use crate::values::{
   Limits, DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_MS, HARD_MAX_BYTES, HARD_MAX_ROWS,
   HARD_TIMEOUT_MS,
 };
-use lmrust::server::{CliError, CliSpec, OpDef, Policy};
+use lmrust::server::{CliError, CliSpec, ErrorCode, OpDef, Policy};
 use lmrust::{Access, InputForm, OperationSchema, ParamSpec, ParamType, Record, ReturnType};
 use serde_json::{json, Value};
 
@@ -82,6 +82,15 @@ fn out_format_param() -> ParamSpec {
     .describe("Format of the out file: ndjson (one JSON object per row), csv (RFC 4180, header row) or json (one array); default from the out extension, else ndjson")
 }
 
+/// `--dangerously-bypass-permission-settings`: on every operation.
+pub const BYPASS_PARAM: &str = "dangerouslyBypassPermissionSettings";
+
+fn bypass_param() -> ParamSpec {
+  ParamSpec::new(BYPASS_PARAM, ParamType::Boolean)
+    .optional()
+    .describe("Skip the settings file's permission rules for this call (connection levels, table rules, the direct-access gate, output.dir); only works when the settings file sets allow_bypass: true. The operational limits still apply")
+}
+
 fn timeout_param() -> ParamSpec {
   ParamSpec::new("timeoutMs", ParamType::Number)
     .optional()
@@ -123,6 +132,7 @@ pub fn schemas() -> Vec<OperationSchema> {
         out_param(),
         out_format_param(),
         timeout_param(),
+        bypass_param(),
       ],
     ),
     schema(
@@ -138,13 +148,21 @@ pub fn schemas() -> Vec<OperationSchema> {
         out_param(),
         out_format_param(),
         timeout_param(),
+        bypass_param(),
       ],
     ),
     schema(
       "tables",
       Access::Read,
       "List tables and views (internal sqlite_* objects excluded)",
-      vec![db_param(), connection_param(), schema_param(), list_max_rows_param(), timeout_param()],
+      vec![
+        db_param(),
+        connection_param(),
+        schema_param(),
+        list_max_rows_param(),
+        timeout_param(),
+        bypass_param(),
+      ],
     ),
     schema(
       "describe",
@@ -158,6 +176,7 @@ pub fn schemas() -> Vec<OperationSchema> {
         connection_param(),
         schema_param(),
         timeout_param(),
+        bypass_param(),
       ],
     ),
   ]
@@ -193,10 +212,39 @@ fn with_backend(
   let settings = Settings::load(&env, &mut |warning| eprintln!("{warning}"))
     .map_err(|e| e.into_cli_error(&[]))?;
   let mut secrets = settings.secrets(&env);
+  let bypass = match (
+    &settings.source,
+    params.get(BYPASS_PARAM) == Some(&Value::Bool(true)),
+  ) {
+    (Some(file), true) if !settings.allow_bypass => {
+      return Err(
+        DbError::new(
+          ErrorCode::Forbidden,
+          "BYPASS_NOT_ALLOWED",
+          format!(
+            "--dangerously-bypass-permission-settings is not allowed: the operator must set \
+             \"allow_bypass\": true in {}",
+            file.display()
+          ),
+        )
+        .into_cli_error(&secrets),
+      );
+    }
+    (Some(file), true) => {
+      eprintln!(
+        "lmsql: permission settings bypassed for this call (allow_bypass is true in {})",
+        file.display()
+      );
+      true
+    }
+    // No settings file: nothing to bypass.
+    _ => false,
+  };
   let (target, access) = connection::resolve_with(
     text(params, "db"),
     text(params, "connection"),
     &settings,
+    bypass,
     env,
   )
   .map_err(|e| e.into_cli_error(&secrets))?;

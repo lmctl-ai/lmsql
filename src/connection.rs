@@ -293,13 +293,14 @@ pub fn resolve_with(
   db: Option<&str>,
   connection: Option<&str>,
   settings: &Settings,
+  bypass: bool,
   lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<(Target, Access), DbError> {
   let Some(file) = &settings.source else {
     return Ok((resolve(db, connection, lookup)?, Access::open()));
   };
   match (db, connection) {
-    (Some(_), None) if !settings.allow_direct => Err(DbError::new(
+    (Some(_), None) if !settings.allow_direct && !bypass => Err(DbError::new(
       ErrorCode::Forbidden,
       "DIRECT_NOT_ALLOWED",
       format!(
@@ -322,6 +323,13 @@ pub fn resolve_with(
           ),
         )
       })?;
+      // A bypass (allowed by allow_bypass) skips the permission rules: full access as the
+      // database allows, through the readwrite login.
+      let (default, tables) = if bypass {
+        (Level::ReadWrite, Default::default())
+      } else {
+        (conn.default, conn.tables.clone())
+      };
       let rule = |manual| Rule {
         connection: name.to_string(),
         settings: file.clone(),
@@ -331,8 +339,8 @@ pub fn resolve_with(
         Driver::Sqlite { written, path } => Ok((
           Target::Sqlite(path.clone()),
           Access {
-            level: conn.default,
-            tables: TableRules::new(conn.default, &conn.tables),
+            level: default,
+            tables: TableRules::new(default, &tables),
             rule: Some(rule(Manual::Sqlite(written.clone()))),
           },
         )),
@@ -342,7 +350,7 @@ pub fn resolve_with(
         } => {
           // readonly: the readonly login if there is one (else the readwrite login, with every
           // transaction READ ONLY); readwrite: the readwrite login, or the only one.
-          let login = match conn.default {
+          let login = match default {
             Level::ReadOnly => readonly.as_ref().or(readwrite.as_ref()),
             _ => readwrite.as_ref().or(readonly.as_ref()),
           }
@@ -353,11 +361,11 @@ pub fn resolve_with(
             Login::Literal(_) => Manual::PsqlLiteral,
           };
           let access = Access {
-            level: conn.default,
-            tables: TableRules::new(conn.default, &Default::default()),
+            level: default,
+            tables: TableRules::new(default, &Default::default()),
             rule: Some(rule(manual)),
           };
-          if conn.default == Level::None {
+          if default == Level::None {
             // Never connects; no DSN needed.
             return Ok((Target::Postgres(String::new()), access));
           }

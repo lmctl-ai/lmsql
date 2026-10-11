@@ -547,3 +547,121 @@ fn sqlite_table_rules() {
     .collect();
   assert_eq!(names, ["audit", "leaky", "t"]);
 }
+
+// ---- the bypass flag ---------------------------------------------------------------------------
+
+#[test]
+fn bypass_needs_allow_bypass() {
+  let st = Setup::new();
+  let db = s(&st.path("app.db"));
+  const FLAG: &str = "--dangerously-bypass-permission-settings";
+  let settings = |allow_bypass: bool| {
+    json!({"version": 1, "allow_bypass": allow_bypass, "connections": {"app": {"driver": "sqlite",
+      "path": "app.db", "permissions": {"default": "readonly", "tables": {"t": "none"}}}}})
+  };
+  // (allow_bypass, args, exit, tool code or "ok", bypass line on stderr)
+  type Case<'a> = (bool, Vec<&'a str>, i32, &'a str, bool);
+  let cases: Vec<Case> = vec![
+    (
+      false,
+      vec![
+        "exec",
+        "--connection",
+        "app",
+        "INSERT INTO t VALUES ('b')",
+        FLAG,
+      ],
+      6,
+      "BYPASS_NOT_ALLOWED",
+      false,
+    ),
+    (
+      false,
+      vec!["query", "--db", &db, "SELECT 1", FLAG],
+      6,
+      "BYPASS_NOT_ALLOWED",
+      false,
+    ),
+    (
+      false,
+      vec!["exec", "--connection", "app", "INSERT INTO t VALUES ('b')"],
+      6,
+      "PERMISSION_DENIED",
+      false,
+    ),
+    // Allowed: connection level, table rules and the direct gate are skipped for this call.
+    (
+      true,
+      vec![
+        "exec",
+        "--connection",
+        "app",
+        "INSERT INTO t VALUES ('b')",
+        FLAG,
+      ],
+      0,
+      "ok",
+      true,
+    ),
+    (
+      true,
+      vec!["tables", "--connection", "app", FLAG],
+      0,
+      "ok",
+      true,
+    ),
+    (
+      true,
+      vec!["query", "--db", &db, "SELECT 1", FLAG],
+      0,
+      "ok",
+      true,
+    ),
+    // Without the flag the rules still apply.
+    (
+      true,
+      vec!["exec", "--connection", "app", "INSERT INTO t VALUES ('b')"],
+      6,
+      "PERMISSION_DENIED",
+      false,
+    ),
+  ];
+  for (allow, args, exit, expect, line) in cases {
+    st.write(&settings(allow));
+    let out = st.run(&args, &[]);
+    assert_eq!(out.code, exit, "{allow} {args:?}: {}", out.text());
+    if expect != "ok" {
+      assert_eq!(out.tool_code(), expect, "{allow} {args:?}");
+    }
+    if expect == "BYPASS_NOT_ALLOWED" {
+      assert!(out.text().contains("allow_bypass"), "{}", out.text());
+    }
+    assert_eq!(
+      out.stderr.contains("permission settings bypassed"),
+      line,
+      "{args:?}: {}",
+      out.stderr
+    );
+  }
+  assert_eq!(st.rows(), 2, "exactly the one bypassed insert ran");
+  // Bypass does not lift the operational caps.
+  st.write(&settings(true));
+  let out = st.run(
+    &[
+      "query",
+      "--connection",
+      "app",
+      "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c",
+      "--timeout-ms",
+      "300",
+      FLAG,
+    ],
+    &[],
+  );
+  assert_eq!(out.tool_code(), "TIMEOUT", "{}", out.text());
+  // No settings file: the flag is a harmless no-op.
+  std::fs::remove_file(st.settings()).unwrap();
+  let out = st.run(&["query", "--db", &db, "SELECT 1", FLAG], &[]);
+  assert_eq!(out.code, 0, "{}", out.text());
+  assert!(out.stderr.is_empty(), "{}", out.stderr);
+}
