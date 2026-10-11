@@ -1,6 +1,6 @@
 [package]
 name = "lmsql"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT"
@@ -18,6 +18,12 @@ lmrust = { git = "https://github.com/lmctl-ai/lmrust", tag = "v0.1.2", default-f
 # limits: SQLITE_LIMIT_ATTACHED = 0; column_decltype: declared column types in results.
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits", "column_decltype"] }
 serde_json = "1"
+# PostgreSQL (phase 2): sync driver, rustls TLS (ring provider), Mozilla roots. No system TLS.
+postgres = "0.19"
+fallible-iterator = "0.2"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tempfile = "3"

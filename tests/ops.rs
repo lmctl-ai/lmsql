@@ -272,13 +272,14 @@ fn named_connections_from_the_environment() {
   }
   let out = run_with(
     &["query", "--connection", "pg", "select 1"],
-    &[("LMSQL_PG", "postgresql://u:p@h/db")],
+    &[(
+      "LMSQL_PG",
+      "postgresql://u:p@h.invalid/db?connect_timeout=2",
+    )],
     std::time::Duration::from_secs(20),
   );
-  assert_eq!(
-    (out.code, out.tool_code().as_str()),
-    (2, "UNSUPPORTED_BACKEND")
-  );
+  // A Postgres DSN is a Postgres connection now; this host does not exist.
+  assert_eq!((out.code, out.tool_code().as_str()), (8, "CONNECT_FAILED"));
   let out = run(&["query", "--connection", "nope", "select 1"]);
   assert_eq!(
     (out.code, out.tool_code().as_str()),

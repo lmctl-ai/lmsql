@@ -16,13 +16,19 @@ pub const TOOL: &str = "lmsql";
 fn db_param() -> ParamSpec {
   ParamSpec::new("db", ParamType::String)
     .optional()
-    .describe("Path of the SQLite database file (or use connection)")
+    .describe("Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection")
 }
 
 fn connection_param() -> ParamSpec {
   ParamSpec::new("connection", ParamType::String)
     .optional()
-    .describe("Name of a configured connection: the value of the environment variable LMSQL_<NAME>")
+    .describe("Name of a configured connection: the environment variable LMSQL_<NAME> holds a SQLite path or a postgres:// DSN")
+}
+
+fn schema_param() -> ParamSpec {
+  ParamSpec::new("schema", ParamType::String)
+    .optional()
+    .describe("Schema to look in (PostgreSQL; SQLite has only main)")
 }
 
 fn statement_param(what: &str) -> ParamSpec {
@@ -93,7 +99,7 @@ pub fn schemas() -> Vec<OperationSchema> {
     schema(
       "exec",
       Access::Write,
-      "Run one SQL statement that changes data or schema; returns rows_affected and last_insert_rowid",
+      "Run one SQL statement that changes data or schema in its own transaction; returns rows_affected and last_insert_rowid (null on PostgreSQL)",
       vec![
         statement_param("INSERT, UPDATE, DELETE, CREATE, ...; RETURNING rows are returned"),
         db_param(),
@@ -110,7 +116,7 @@ pub fn schemas() -> Vec<OperationSchema> {
       "tables",
       Access::Read,
       "List tables and views (internal sqlite_* objects excluded)",
-      vec![db_param(), connection_param(), max_rows_param(), timeout_param()],
+      vec![db_param(), connection_param(), schema_param(), max_rows_param(), timeout_param()],
     ),
     schema(
       "describe",
@@ -119,9 +125,10 @@ pub fn schemas() -> Vec<OperationSchema> {
       vec![
         ParamSpec::new("table", ParamType::String)
           .positional()
-          .describe("Table or view name (case-insensitive)"),
+          .describe("Table or view name: SQLite matches case-insensitively; PostgreSQL follows SQL rules (schema.table, quoting), or the exact name when schema is given"),
         db_param(),
         connection_param(),
+        schema_param(),
         timeout_param(),
       ],
     ),
@@ -178,44 +185,71 @@ pub fn spec() -> CliSpec<Policy> {
   };
   CliSpec::with_policy(TOOL)
     .version(env!("CARGO_PKG_VERSION"))
-    .description("One SQL statement in, structured JSON out (SQLite)")
+    .description("One SQL statement in, structured JSON out (SQLite, PostgreSQL)")
     .inputs([InputForm::Flags, InputForm::Json])
     .op(
-      OpDef::new("query", Access::Read, op("query").description.unwrap_or_default(), |params, _| {
-        with_backend(params, |b, l| b.query(statement(params), l).map(|r| r.to_json()))
-      })
+      OpDef::new(
+        "query",
+        Access::Read,
+        op("query").description.unwrap_or_default(),
+        |params, _| {
+          with_backend(params, |b, l| {
+            b.query(statement(params), l).map(|r| r.to_json())
+          })
+        },
+      )
       .schema(op("query")),
     )
     .op(
-      OpDef::new("exec", Access::Write, op("exec").description.unwrap_or_default(), |params, policy: &Policy| {
-        // The statement is not echoed into the policy result: it may hold literals the caller
-        // treats as sensitive, and the caller already has it.
-        let ctx = CheckContext::new("exec").dangerous(true);
-        if let Some(simulated) = check_policy(Access::Write, policy, &ctx)? {
-          return Ok(Value::Object(simulated));
-        }
-        let create = params.get("create") == Some(&Value::Bool(true));
-        with_backend(params, |b, l| b.exec(statement(params), l, create).map(|r| r.to_json()))
-      })
+      OpDef::new(
+        "exec",
+        Access::Write,
+        op("exec").description.unwrap_or_default(),
+        |params, policy: &Policy| {
+          // The statement is not echoed into the policy result: it may hold literals the caller
+          // treats as sensitive, and the caller already has it.
+          let ctx = CheckContext::new("exec").dangerous(true);
+          if let Some(simulated) = check_policy(Access::Write, policy, &ctx)? {
+            return Ok(Value::Object(simulated));
+          }
+          let create = params.get("create") == Some(&Value::Bool(true));
+          with_backend(params, |b, l| {
+            b.exec(statement(params), l, create).map(|r| r.to_json())
+          })
+        },
+      )
       .schema(op("exec")),
     )
     .op(
-      OpDef::new("tables", Access::Read, op("tables").description.unwrap_or_default(), |params, _| {
-        with_backend(params, |b, l| {
-          let (tables, truncated) = b.tables(l)?;
-          Ok(json!({
-            "tables": tables.iter().map(|t| json!({"name": t.name, "type": t.kind})).collect::<Vec<_>>(),
-            "truncated": truncated,
-          }))
-        })
-      })
+      OpDef::new(
+        "tables",
+        Access::Read,
+        op("tables").description.unwrap_or_default(),
+        |params, _| {
+          with_backend(params, |b, l| {
+            let (tables, truncated) = b.tables(text(params, "schema"), l)?;
+            Ok(json!({
+              "tables": tables.iter().map(|t| t.to_json()).collect::<Vec<_>>(),
+              "truncated": truncated,
+            }))
+          })
+        },
+      )
       .schema(op("tables")),
     )
     .op(
-      OpDef::new("describe", Access::Read, op("describe").description.unwrap_or_default(), |params, _| {
-        let table = text(params, "table").unwrap_or_default();
-        with_backend(params, |b, l| b.describe(table, l).map(|d| d.to_json()))
-      })
+      OpDef::new(
+        "describe",
+        Access::Read,
+        op("describe").description.unwrap_or_default(),
+        |params, _| {
+          let table = text(params, "table").unwrap_or_default();
+          with_backend(params, |b, l| {
+            b.describe(text(params, "schema"), table, l)
+              .map(|d| d.to_json())
+          })
+        },
+      )
       .schema(op("describe")),
     )
 }

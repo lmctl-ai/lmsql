@@ -43,6 +43,15 @@ pub fn resolve(
           "db is empty",
         ));
       }
+      if crate::backend::postgres::dsn::is_postgres_dsn(path) {
+        // argv is visible to every user of the machine (ps, /proc): no credentials there.
+        return Err(DbError::new(
+          ErrorCode::ValidationError,
+          "DSN_ON_COMMAND_LINE",
+          "PostgreSQL DSNs are not accepted on the command line (other users can read argv); \
+           put the DSN in LMSQL_<NAME> and pass connection NAME",
+        ));
+      }
       Ok(Target::Sqlite(PathBuf::from(path)))
     }
     (None, Some(name)) => {
@@ -84,16 +93,14 @@ pub fn parse_dsn(name: &str, value: &str) -> Result<Target, DbError> {
     }
     return Ok(Target::Sqlite(PathBuf::from(path)));
   }
+  if crate::backend::postgres::dsn::is_postgres_dsn(value) {
+    return Ok(Target::Postgres(value.trim().to_string()));
+  }
   if let Some((scheme, _)) = lower.split_once("://") {
-    let supported_later = matches!(scheme, "postgres" | "postgresql");
     return Err(DbError::new(
       ErrorCode::ValidationError,
       "UNSUPPORTED_BACKEND",
-      if supported_later {
-        format!("connection {name:?} is a Postgres DSN; this lmsql supports SQLite only (Postgres is planned)")
-      } else {
-        format!("connection {name:?} uses an unsupported scheme {scheme:?}")
-      },
+      format!("connection {name:?} uses an unsupported scheme {scheme:?} (SQLite paths and postgres:// DSNs are supported)"),
     ));
   }
   Ok(Target::Sqlite(PathBuf::from(value)))
@@ -160,8 +167,14 @@ mod tests {
       resolve(None, Some("short"), &e).unwrap(),
       Target::Sqlite("rel.db".into())
     );
+    assert_eq!(
+      resolve(None, Some("pg"), &e).unwrap(),
+      Target::Postgres("postgres://user:secret@host/db".into())
+    );
+    let err = resolve(Some("postgresql://user:secret@host/db"), None, &e).unwrap_err();
+    assert_eq!(err.tool_code, "DSN_ON_COMMAND_LINE");
+    assert!(!err.message.contains("secret"));
     for (name, code) in [
-      ("pg", "UNSUPPORTED_BACKEND"),
       ("odd", "UNSUPPORTED_BACKEND"),
       ("blank", "CONNECTION_NOT_FOUND"),
       ("missing", "CONNECTION_NOT_FOUND"),

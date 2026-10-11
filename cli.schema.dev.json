@@ -1,7 +1,7 @@
 {
   "schema": "cli.schema.v1",
   "tool": "lmsql",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "policy": {
     "dryrun": true,
     "readonly": true
@@ -122,13 +122,13 @@
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of the SQLite database file (or use connection)"
+          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
         },
         {
           "name": "connection",
           "type": "string",
           "occurs": "?",
-          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+          "description": "Name of a configured connection: the environment variable LMSQL_<NAME> holds a SQLite path or a postgres:// DSN"
         },
         {
           "name": "maxRows",
@@ -157,7 +157,7 @@
       "name": "exec",
       "access": "write",
       "returns": "object",
-      "description": "Run one SQL statement that changes data or schema; returns rows_affected and last_insert_rowid",
+      "description": "Run one SQL statement that changes data or schema in its own transaction; returns rows_affected and last_insert_rowid (null on PostgreSQL)",
       "params": [
         {
           "name": "statement",
@@ -169,13 +169,13 @@
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of the SQLite database file (or use connection)"
+          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
         },
         {
           "name": "connection",
           "type": "string",
           "occurs": "?",
-          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+          "description": "Name of a configured connection: the environment variable LMSQL_<NAME> holds a SQLite path or a postgres:// DSN"
         },
         {
           "name": "create",
@@ -216,13 +216,19 @@
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of the SQLite database file (or use connection)"
+          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
         },
         {
           "name": "connection",
           "type": "string",
           "occurs": "?",
-          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+          "description": "Name of a configured connection: the environment variable LMSQL_<NAME> holds a SQLite path or a postgres:// DSN"
+        },
+        {
+          "name": "schema",
+          "type": "string",
+          "occurs": "?",
+          "description": "Schema to look in (PostgreSQL; SQLite has only main)"
         },
         {
           "name": "maxRows",
@@ -250,19 +256,25 @@
           "name": "table",
           "type": "string",
           "positional": true,
-          "description": "Table or view name (case-insensitive)"
+          "description": "Table or view name: SQLite matches case-insensitively; PostgreSQL follows SQL rules (schema.table, quoting), or the exact name when schema is given"
         },
         {
           "name": "db",
           "type": "string",
           "occurs": "?",
-          "description": "Path of the SQLite database file (or use connection)"
+          "description": "Path of a SQLite database file. PostgreSQL DSNs are not accepted here (argv is visible to other users); use connection"
         },
         {
           "name": "connection",
           "type": "string",
           "occurs": "?",
-          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+          "description": "Name of a configured connection: the environment variable LMSQL_<NAME> holds a SQLite path or a postgres:// DSN"
+        },
+        {
+          "name": "schema",
+          "type": "string",
+          "occurs": "?",
+          "description": "Schema to look in (PostgreSQL; SQLite has only main)"
         },
         {
           "name": "timeoutMs",
