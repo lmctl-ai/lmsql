@@ -1,7 +1,7 @@
-//! Database backends. Phase 1 ships SQLite only; a backend is chosen per call from the resolved
-//! [`Target`] and implements [`Backend`]. Adding Postgres (phase 2) means a new `Target` variant,
-//! a new module implementing `Backend`, and the DSN scheme in `connection.rs`.
+//! Database backends: SQLite (phase 1) and PostgreSQL (phase 2). A backend is chosen per call
+//! from the resolved [`Target`] and implements [`Backend`].
 
+pub mod postgres;
 pub mod sqlite;
 
 use crate::error::DbError;
@@ -14,12 +14,15 @@ use std::path::PathBuf;
 pub enum Target {
   /// A SQLite database file.
   Sqlite(PathBuf),
+  /// A PostgreSQL DSN (from `LMSQL_<NAME>` only; never from argv).
+  Postgres(String),
 }
 
 impl Target {
   pub fn backend(&self) -> Box<dyn Backend> {
     match self {
       Target::Sqlite(path) => Box::new(sqlite::Sqlite::new(path.clone())),
+      Target::Postgres(dsn) => Box::new(postgres::Postgres::new(dsn.clone())),
     }
   }
 
@@ -34,6 +37,10 @@ impl Target {
         out.retain(|s| !s.is_empty());
         out
       }
+      Target::Postgres(dsn) => match postgres::dsn::parse(dsn) {
+        Ok(parsed) => parsed.secrets,
+        Err(_) => vec![dsn.clone()],
+      },
     }
   }
 }
@@ -74,7 +81,8 @@ impl Rows {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecOutcome {
   pub rows_affected: u64,
-  pub last_insert_rowid: i64,
+  /// SQLite's last rowid; `None` (JSON `null`) for PostgreSQL, which has none (use RETURNING).
+  pub last_insert_rowid: Option<i64>,
   pub returning: Option<Rows>,
 }
 
@@ -96,6 +104,18 @@ impl ExecOutcome {
 pub struct TableEntry {
   pub name: String,
   pub kind: String,
+  /// The PostgreSQL schema; `None` for SQLite (the key is omitted).
+  pub schema: Option<String>,
+}
+
+impl TableEntry {
+  pub fn to_json(&self) -> Value {
+    let mut out = json!({"name": self.name, "type": self.kind});
+    if let Some(schema) = &self.schema {
+      out["schema"] = json!(schema);
+    }
+    out
+  }
 }
 
 /// One column of `describe`.
@@ -114,12 +134,14 @@ pub struct ColumnInfo {
 pub struct TableDescription {
   pub name: String,
   pub kind: String,
+  /// The PostgreSQL schema; `None` for SQLite (the key is omitted).
+  pub schema: Option<String>,
   pub columns: Vec<ColumnInfo>,
 }
 
 impl TableDescription {
   pub fn to_json(&self) -> Value {
-    json!({
+    let mut out = json!({
       "table": self.name,
       "type": self.kind,
       "columns": self.columns.iter().map(|c| json!({
@@ -130,7 +152,11 @@ impl TableDescription {
         "default": c.default,
         "pk": c.pk,
       })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(schema) = &self.schema {
+      out["schema"] = json!(schema);
+    }
+    out
   }
 }
 
@@ -141,8 +167,18 @@ pub trait Backend {
   fn query(&self, sql: &str, limits: &Limits) -> Result<Rows, DbError>;
   /// One statement of any kind. `create` allows creating a missing database.
   fn exec(&self, sql: &str, limits: &Limits, create: bool) -> Result<ExecOutcome, DbError>;
-  /// Tables and views (internal objects excluded), capped by `limits.max_rows`.
-  fn tables(&self, limits: &Limits) -> Result<(Vec<TableEntry>, bool), DbError>;
-  /// Columns of one table or view.
-  fn describe(&self, table: &str, limits: &Limits) -> Result<TableDescription, DbError>;
+  /// Tables and views (internal objects excluded), capped by `limits.max_rows`; `schema` limits
+  /// the list to one schema.
+  fn tables(
+    &self,
+    schema: Option<&str>,
+    limits: &Limits,
+  ) -> Result<(Vec<TableEntry>, bool), DbError>;
+  /// Columns of one table or view (`schema` names it exactly; otherwise the backend's lookup).
+  fn describe(
+    &self,
+    schema: Option<&str>,
+    table: &str,
+    limits: &Limits,
+  ) -> Result<TableDescription, DbError>;
 }

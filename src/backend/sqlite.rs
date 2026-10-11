@@ -358,13 +358,21 @@ impl Backend for Sqlite {
     drop(stmt);
     Ok(ExecOutcome {
       rows_affected: conn.changes(),
-      last_insert_rowid: conn.last_insert_rowid(),
+      last_insert_rowid: Some(conn.last_insert_rowid()),
       returning,
     })
   }
 
-  fn tables(&self, limits: &Limits) -> Result<(Vec<TableEntry>, bool), DbError> {
+  fn tables(
+    &self,
+    schema: Option<&str>,
+    limits: &Limits,
+  ) -> Result<(Vec<TableEntry>, bool), DbError> {
     let conn = open(&self.path, Mode::Read, limits)?;
+    // SQLite has one schema here (`main`; ATTACH is disabled).
+    if schema.is_some_and(|s| !s.eq_ignore_ascii_case("main")) {
+      return Ok((Vec::new(), false));
+    }
     let mut stmt = conn.prepare(
       "SELECT name, type FROM sqlite_schema \
        WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
@@ -381,13 +389,26 @@ impl Backend for Sqlite {
       out.push(TableEntry {
         name: row.get(0)?,
         kind: row.get(1)?,
+        schema: None,
       });
     }
     Ok((out, truncated))
   }
 
-  fn describe(&self, table: &str, limits: &Limits) -> Result<TableDescription, DbError> {
+  fn describe(
+    &self,
+    schema: Option<&str>,
+    table: &str,
+    limits: &Limits,
+  ) -> Result<TableDescription, DbError> {
     let conn = open(&self.path, Mode::Read, limits)?;
+    if schema.is_some_and(|s| !s.eq_ignore_ascii_case("main")) {
+      return Err(DbError::new(
+        ErrorCode::NotFound,
+        "TABLE_NOT_FOUND",
+        format!("no table or view named {table:?} in that schema"),
+      ));
+    }
     let found: Option<(String, String)> = conn
       .prepare(
         "SELECT name, type FROM sqlite_schema \
@@ -424,6 +445,7 @@ impl Backend for Sqlite {
     Ok(TableDescription {
       name,
       kind,
+      schema: None,
       columns,
     })
   }
