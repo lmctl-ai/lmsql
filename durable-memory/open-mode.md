@@ -7,8 +7,8 @@ owner's databases, so the earlier in-tool guards are postponed, not abandoned.
 ## What this means
 
 - `query` and `exec` are the same operation in two names: both run reads, writes and DDL and
-  return one shape (`{columns, rows, row_count, rows_affected, last_insert_rowid, truncated,
-  truncated_by}`). lmapi access is `dynamic`, so no `--confirm`.
+  return one shape (inline rows, or a file summary for a big result; `big-results.md`). lmapi
+  access is `dynamic`, so no `--confirm`.
 - SQLite opens read-write and creates the file if missing; multiple statements run
   (`execute_batch`), and the last statement's rows are returned.
 - PostgreSQL runs autocommit over the simple protocol, except a single row-returning statement
@@ -31,9 +31,9 @@ authorizer and size/heap limits, the PostgreSQL READ ONLY transaction, the state
 and the `single_statement` rule) is in git history on branch `phase2-postgres` and at commit
 `0a3877f`. `safety.md` and `phase2.md` describe that design and are kept for when it returns.
 
-## What is still enforced (operational caps, not security)
+## What is still enforced (operational, not security)
 
-`--max-rows`, `--max-bytes` (both set `truncated`/`truncated_by`; a single statement is read
-through a cursor so it does not materialize), and `--timeout-ms` (one deadline per call). Plus
-secret scrubbing of database paths and DSNs in error messages, and `tool_code`s on errors.
-`scripts/mutation-check.py` covers these: 4 mutants, each killed by a dedicated test.
+Big results go to a file instead of being truncated (`big-results.md`), `--timeout-ms` (one
+deadline per call), secret scrubbing of database paths and DSNs in error messages, and
+`tool_code`s on errors. `scripts/mutation-check.py` covers these: 8 mutants, each killed by a
+dedicated test.

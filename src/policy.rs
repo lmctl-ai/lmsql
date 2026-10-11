@@ -1,5 +1,9 @@
 //! The policy seam.
 //!
+//! Planned configuration items (not implemented): allow/deny lists, a read-only mode,
+//! per-connection rules, and a **disk-space cap** for `out` / spill files (today a big result is
+//! written in full; see `crate::output`).
+//!
 //! Open mode (v1) runs any SQL the database accepts: this policy allows everything. It is the
 //! single place every request's SQL passes through, so later versions can load limits here
 //! (allow/deny lists, read-only enforcement, per-connection rules) from a config file named by

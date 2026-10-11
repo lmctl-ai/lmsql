@@ -2,7 +2,18 @@
 
 ## 0.2.0 (unreleased)
 
-Open mode, plus a PostgreSQL backend.
+Open mode, a PostgreSQL backend, and big results to a file.
+
+- **Big results go to a file, never truncated** (lmsql is stateless: no paging between calls).
+  New params `out` and `outFormat` (ndjson | csv | json): with `out`, the full result is streamed
+  to that file and the response is a summary (`file {path, format, bytes, rows}`, `preview`,
+  `overwrote`). Without `out`, a result past `maxRows` / `maxBytes` (now inline thresholds) spills
+  in full to `$LMSQL_OUT_DIR` (default `<temp>/lmsql/`, 0700, must be private) as
+  `lmsql-<UTC stamp>-<random>.ndjson`, with `spilled: true`. Rows are streamed with bounded memory
+  (5M rows at ~5 MiB peak RSS, both backends); files are written to a 0600 temp name and renamed
+  on success, removed on error; `out` is checked before the SQL runs (`OUT_NOT_WRITABLE`).
+  `truncated` remains as a legacy field (always false for `query`/`exec`). Spill files are never
+  deleted by lmsql. `maxRows` no longer declares a default in the schema (still 200).
 
 - **Open mode (owner decision):** lmsql runs any SQL the database accepts. `query` and `exec`
   are equivalent (lmapi access `dynamic`, no `--confirm`). The read-only guards, keyword
