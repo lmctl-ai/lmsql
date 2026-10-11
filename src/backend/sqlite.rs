@@ -401,7 +401,7 @@ mod tests {
 
   fn run(db: &Sqlite, sql: &str, inline_rows: usize) -> (Collected, RunStats) {
     let mut sink =
-      Sink::new(OutputConfig::new(None, None, inline_rows, 1 << 20, false, false).unwrap());
+      Sink::new(OutputConfig::new(None, None, inline_rows, 1 << 20, false, false, None).unwrap());
     let stats = db.run(sql, &Limits::default(), &mut sink).unwrap();
     (sink.finish().unwrap(), stats)
   }
