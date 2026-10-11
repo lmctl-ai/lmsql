@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+Open mode, plus a PostgreSQL backend.
+
+- **Open mode (owner decision):** lmsql runs any SQL the database accepts. `query` and `exec`
+  are equivalent (lmapi access `dynamic`, no `--confirm`). The read-only guards, keyword
+  allowlist, single-statement rule, ATTACH/pragma/size limits and transaction-control refusal
+  are removed; restrict access with the database (a read-only role, file permissions). The
+  previous hardening is in git history (branch `phase2-postgres`, commit `0a3877f`) and is
+  planned to return behind config. A `Policy` seam (`src/policy.rs`, reads `LMSQL_CONFIG`)
+  currently allows everything.
+- **PostgreSQL:** `postgres://` / `postgresql://` DSNs via `LMSQL_<NAME>` (`--connection`) or
+  directly via `--db`. rustls TLS (ring provider, bundled Mozilla roots); `sslmode`
+  disable/prefer/require/verify-ca/verify-full, default `prefer` local / `verify-full` remote.
+  A single row-returning statement is read through a server cursor so a huge result stops at the
+  cap; errors map from SQLSTATE (`PG_<code>`); connection failures are one `CONNECT_FAILED` with
+  no host/user/password; `tables`/`describe` take a `schema` param.
+- **One result shape** for `query`/`exec`: `{columns, rows, row_count, rows_affected,
+  last_insert_rowid, truncated, truncated_by}`.
+- Kept: `--max-rows` / `--max-bytes` / `--timeout-ms`, `tool_code`s, secret scrubbing of DSNs in
+  error text. Builds on Rust 1.79.
+
 ## 0.1.0 (unreleased)
 
 First version (phase 1, SQLite):
