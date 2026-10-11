@@ -48,6 +48,24 @@ impl Target {
   }
 }
 
+/// What a dry run found: the SQL only reads (it ran normally, rows are in the sink), or some
+/// statement would change something (nothing was executed).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DryRun {
+  Read(RunStats),
+  WouldChange(Vec<Planned>),
+}
+
+/// One statement of a dry run that would change something (or, for SQLite multi-statement text,
+/// any statement of it), with the database's own plan where it can give one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Planned {
+  pub statement: String,
+  pub would_change: bool,
+  pub plan: Value,
+  pub estimated_rows: Option<f64>,
+}
+
 /// How the settings restrict a call's database handle.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mode {
@@ -144,6 +162,9 @@ pub trait Backend {
   /// (never all in memory), and return what the last statement changed. `query` and `exec` both
   /// call this.
   fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError>;
+  /// Dry run: estimate without changing anything. Reads run as in [`Backend::run`]; if anything
+  /// would change, nothing is executed and the statements are reported with their plans.
+  fn dry_run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<DryRun, DbError>;
   /// Tables and views (internal objects excluded), capped by `limits.max_rows`; `schema` limits
   /// the list to one schema.
   fn tables(

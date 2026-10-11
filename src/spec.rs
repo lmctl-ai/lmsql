@@ -1,8 +1,9 @@
 //! The published lmapi operations (`query`, `exec`, `tables`, `describe`) and their handlers.
 
 use crate::backend::Backend;
+use crate::backend::DryRun;
 use crate::connection;
-use crate::connection::Intent;
+use crate::connection::{Access as Granted, Intent};
 use crate::error::DbError;
 use crate::output::{Format, OutputConfig, Sink, DEFAULT_PREVIEW_ROWS};
 use crate::policy::Policy as OpenPolicy;
@@ -187,7 +188,7 @@ fn env(name: &str) -> Option<String> {
 fn with_backend(
   params: &Record,
   intent: Intent<'_>,
-  f: impl FnOnce(&dyn Backend, &Limits, &dyn Fn(&str) -> bool) -> Result<Value, DbError>,
+  f: impl FnOnce(&dyn Backend, &Limits, &Granted) -> Result<Value, DbError>,
 ) -> Result<Value, CliError> {
   let settings = Settings::load(&env, &mut |warning| eprintln!("{warning}"))
     .map_err(|e| e.into_cli_error(&[]))?;
@@ -210,10 +211,8 @@ fn with_backend(
   }
   let limits = limits(params).map_err(|e| e.into_cli_error(&secrets))?;
   let backend = target.backend(access.mode());
-  // A `none` table is hidden from `tables`.
-  let hidden = |name: &str| access.rule.is_some() && access.level_of(name) == Level::None;
   // Results carry user data only (rows, names, counts); error messages are scrubbed.
-  f(backend.as_ref(), &limits, &hidden)
+  f(backend.as_ref(), &limits, &access)
     .map_err(|e| access.map_error(e, intent))
     .map_err(|e| e.into_cli_error(&secrets))
 }
@@ -224,9 +223,10 @@ fn statement(params: &Record) -> &str {
 
 /// `query` and `exec` are identical in open mode: both pass the SQL through the policy seam
 /// (which allows everything in v1) and run it, returning one shape.
-fn run_sql(op: &str, params: &Record) -> Result<Value, CliError> {
+fn run_sql(op: &str, params: &Record, dry_run: bool) -> Result<Value, CliError> {
   let sql = statement(params).to_string();
-  with_backend(params, Intent::Sql(statement(params)), |b, l, _| {
+  let intent = Intent::Sql(statement(params));
+  with_backend(params, intent, |b, l, access| {
     OpenPolicy::load().allow(op, &sql)?;
     // Checked before the SQL runs: a bad out path must not follow a committed write.
     let config = OutputConfig::new(
@@ -235,11 +235,68 @@ fn run_sql(op: &str, params: &Record) -> Result<Value, CliError> {
       l.max_rows,
       l.max_bytes,
       params.contains_key("maxRows"),
+      dry_run,
     )?;
     let mut sink = Sink::new(config);
+    if dry_run {
+      return dry_run_result(b, l, &sql, sink, access, intent);
+    }
     let stats = b.run(&sql, l, &mut sink)?;
     Ok(sink.finish()?.to_json(&stats))
   })
+}
+
+/// `--dry-run`: estimate without changing anything. Reads run normally; if anything would
+/// change, nothing is executed and the response describes it. Permissions still apply.
+fn dry_run_result(
+  b: &dyn Backend,
+  l: &Limits,
+  sql: &str,
+  mut sink: Sink,
+  access: &Granted,
+  intent: Intent<'_>,
+) -> Result<Value, DbError> {
+  match b.dry_run(sql, l, &mut sink)? {
+    DryRun::Read(stats) => {
+      let mut out = sink.finish()?.to_json(&stats);
+      out["dry_run"] = json!(true);
+      out["executed"] = json!(true);
+      out["would_change"] = json!(false);
+      Ok(out)
+    }
+    DryRun::WouldChange(planned) => {
+      // A write the connection level does not allow stays denied in a dry run.
+      if access.rule.is_some() && access.max_level() <= Level::ReadOnly {
+        return Err(access.denied(intent));
+      }
+      let single = planned.len() == 1;
+      let mut out = json!({
+        "dry_run": true,
+        "executed": false,
+        "would_change": true,
+        "statement": sql,
+        "plan": if single { planned[0].plan.clone() } else { Value::Null },
+      });
+      if let Some(rows) = planned
+        .first()
+        .and_then(|p| p.estimated_rows)
+        .filter(|_| single)
+      {
+        out["estimated_rows"] = json!(rows);
+      }
+      if !single {
+        out["statements"] = Value::Array(
+          planned
+            .iter()
+            .map(
+              |p| json!({"statement": p.statement, "would_change": p.would_change, "plan": p.plan}),
+            )
+            .collect(),
+        );
+      }
+      Ok(out)
+    }
+  }
 }
 
 pub fn spec() -> CliSpec<Policy> {
@@ -260,7 +317,7 @@ pub fn spec() -> CliSpec<Policy> {
         "query",
         Access::Dynamic,
         op("query").description.unwrap_or_default(),
-        |params, _| run_sql("query", params),
+        |params, policy: &Policy| run_sql("query", params, policy.dry_run),
       )
       .schema(op("query")),
     )
@@ -269,7 +326,7 @@ pub fn spec() -> CliSpec<Policy> {
         "exec",
         Access::Dynamic,
         op("exec").description.unwrap_or_default(),
-        |params, _| run_sql("exec", params),
+        |params, policy: &Policy| run_sql("exec", params, policy.dry_run),
       )
       .schema(op("exec")),
     )
@@ -279,9 +336,10 @@ pub fn spec() -> CliSpec<Policy> {
         Access::Read,
         op("tables").description.unwrap_or_default(),
         |params, _| {
-          with_backend(params, Intent::Tables, |b, l, hidden| {
+          with_backend(params, Intent::Tables, |b, l, access| {
             let (mut tables, truncated) = b.tables(text(params, "schema"), l)?;
-            tables.retain(|t| !hidden(&t.name));
+            // A `none` table is hidden.
+            tables.retain(|t| access.rule.is_none() || access.level_of(&t.name) != Level::None);
             Ok(json!({
               "tables": tables.iter().map(|t| t.to_json()).collect::<Vec<_>>(),
               "truncated": truncated,

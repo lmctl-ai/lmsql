@@ -11,7 +11,9 @@
 
 use super::values::to_json;
 use super::{connect, Postgres};
-use crate::backend::{Backend, Column, ColumnInfo, RunStats, TableDescription, TableEntry};
+use crate::backend::{
+  Backend, Column, ColumnInfo, DryRun, Planned, RunStats, TableDescription, TableEntry,
+};
 use crate::error::DbError;
 use crate::output::Sink;
 use crate::values::Limits;
@@ -123,6 +125,58 @@ fn feed(
   Ok(affected)
 }
 
+/// A `json` column read as its text (the plan of `EXPLAIN (FORMAT JSON)`).
+struct JsonText(String);
+
+impl<'a> postgres::types::FromSql<'a> for JsonText {
+  fn from_sql(
+    _: &postgres::types::Type,
+    raw: &'a [u8],
+  ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    Ok(JsonText(String::from_utf8(raw.to_vec())?))
+  }
+  fn accepts(ty: &postgres::types::Type) -> bool {
+    *ty == postgres::types::Type::JSON
+  }
+}
+
+impl Postgres {
+  /// The plan of one statement, best effort: `EXPLAIN (FORMAT JSON)` without ANALYZE plans and
+  /// never executes, and the extended protocol accepts exactly one statement. `null` when the
+  /// text cannot be explained (DDL, multi-statement text).
+  fn plan(&self, sql: &str, limits: &Limits) -> (Value, Option<f64>) {
+    let Ok(mut session) = connect(&self.dsn, limits) else {
+      return (Value::Null, None);
+    };
+    if session.apply_settings(true).is_err() {
+      return (Value::Null, None);
+    }
+    let explained = session
+      .client
+      .query_one(&format!("EXPLAIN (FORMAT JSON) {sql}") as &str, &[])
+      .ok()
+      .and_then(|row| row.try_get::<_, JsonText>(0).ok())
+      .and_then(|text| serde_json::from_str::<Value>(&text.0).ok());
+    match explained {
+      Some(plan) => {
+        // A write's top node (ModifyTable) estimates 0 output rows; the rows it would touch are
+        // the estimate of its input node.
+        let top = &plan[0]["Plan"];
+        let node = if top["Node Type"] == "ModifyTable" {
+          &top["Plans"][0]
+        } else {
+          top
+        };
+        let rows = node["Plan Rows"]
+          .as_f64()
+          .or_else(|| top["Plan Rows"].as_f64());
+        (plan, rows)
+      }
+      None => (Value::Null, None),
+    }
+  }
+}
+
 fn relkind(kind: &str) -> &'static str {
   match kind {
     "v" => "view",
@@ -177,6 +231,28 @@ impl Backend for Postgres {
         let messages = session.client.simple_query(sql).map_err(err)?;
         Ok(stats(feed(messages, None, sink)?))
       }
+    }
+  }
+
+  /// Reads run as usual, in a session whose every transaction is READ ONLY; a statement the
+  /// server refuses there (SQLSTATE 25006) would change something and is reported with its plan.
+  fn dry_run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<DryRun, DbError> {
+    let read_only = Postgres {
+      dsn: self.dsn.clone(),
+      read_only: true,
+    };
+    match read_only.run(sql, limits, sink) {
+      Ok(stats) => Ok(DryRun::Read(stats)),
+      Err(e) if e.tool_code == "PG_25006" => {
+        let (plan, estimated_rows) = self.plan(sql, limits);
+        Ok(DryRun::WouldChange(vec![Planned {
+          statement: sql.to_string(),
+          would_change: true,
+          plan,
+          estimated_rows,
+        }]))
+      }
+      Err(e) => Err(e),
     }
   }
 

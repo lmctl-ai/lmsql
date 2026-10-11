@@ -85,6 +85,8 @@ pub struct OutputConfig {
   pub inline_bytes: usize,
   /// Rows of the preview in a file response.
   pub preview_rows: usize,
+  /// Dry run: no file is ever written (out is reported as `would_write`).
+  pub dry_run: bool,
 }
 
 impl OutputConfig {
@@ -95,6 +97,7 @@ impl OutputConfig {
     inline_rows: usize,
     inline_bytes: usize,
     max_rows_given: bool,
+    dry_run: bool,
   ) -> Result<OutputConfig, DbError> {
     let format = match out_format {
       None => None,
@@ -119,7 +122,9 @@ impl OutputConfig {
       }
       Some(raw) => {
         let path = absolute(raw)?;
-        preflight(&path)?;
+        if !dry_run {
+          preflight(&path)?;
+        }
         let format = format.unwrap_or_else(|| Format::infer(&path));
         Some((path, format))
       }
@@ -133,6 +138,7 @@ impl OutputConfig {
       } else {
         DEFAULT_PREVIEW_ROWS.min(inline_rows)
       },
+      dry_run,
     })
   }
 }
@@ -497,6 +503,8 @@ pub struct Sink {
   preview_bytes: usize,
   file: Option<FileWriter>,
   spilled: bool,
+  /// Dry run: the result passed an inline threshold and would have spilled.
+  would_spill: bool,
   row_count: u64,
 }
 
@@ -513,6 +521,14 @@ pub enum Collected {
     preview: Vec<Vec<Value>>,
     file: FileInfo,
     spilled: bool,
+  },
+  /// A dry run whose result would have gone to a file: nothing written, a preview only.
+  DryRunFile {
+    columns: Vec<Column>,
+    row_count: u64,
+    preview: Vec<Vec<Value>>,
+    would_write: Option<(PathBuf, Format)>,
+    would_spill: bool,
   },
 }
 
@@ -536,6 +552,7 @@ impl Sink {
       preview_bytes: 2,
       file: None,
       spilled: false,
+      would_spill: false,
       row_count: 0,
     }
   }
@@ -548,9 +565,12 @@ impl Sink {
     self.preview.clear();
     self.preview_bytes = 2;
     self.spilled = false;
+    self.would_spill = false;
     self.row_count = 0;
     if let Some((path, format)) = &self.config.out {
-      self.file = Some(FileWriter::create(path, *format, &columns)?);
+      if !self.config.dry_run {
+        self.file = Some(FileWriter::create(path, *format, &columns)?);
+      }
     }
     self.columns = columns;
     Ok(())
@@ -578,12 +598,26 @@ impl Sink {
       self.keep_preview(values);
       return Ok(());
     }
+    if self.config.dry_run && (self.config.out.is_some() || self.would_spill) {
+      self.keep_preview(values);
+      return Ok(());
+    }
     let size = row_size(&values, self.inline.is_empty());
     if self.inline.len() < self.config.inline_rows
       && self.inline_bytes + size <= self.config.inline_bytes
     {
       self.inline_bytes += size;
       self.inline.push(values);
+      return Ok(());
+    }
+    if self.config.dry_run {
+      // Would spill: keep a preview, write nothing.
+      self.would_spill = true;
+      self.inline_bytes = 2;
+      for row in std::mem::take(&mut self.inline) {
+        self.keep_preview(row);
+      }
+      self.keep_preview(values);
       return Ok(());
     }
     // Past an inline threshold: everything goes to a spill file instead.
@@ -606,7 +640,16 @@ impl Sink {
   /// Commit the file (if any) and return what the call produced. With `out` and no result set
   /// at all, an empty file is still written.
   pub fn finish(mut self) -> Result<Collected, DbError> {
-    if self.file.is_none() {
+    if self.config.dry_run && (self.config.out.is_some() || self.would_spill) {
+      return Ok(Collected::DryRunFile {
+        columns: std::mem::take(&mut self.columns),
+        row_count: self.row_count,
+        preview: std::mem::take(&mut self.preview),
+        would_write: self.config.out.clone(),
+        would_spill: self.would_spill,
+      });
+    }
+    if self.file.is_none() && !self.config.dry_run {
       if let Some((path, format)) = self.config.out.clone() {
         self.file = Some(FileWriter::create(&path, format, &self.columns)?);
       }
@@ -649,6 +692,32 @@ impl Collected {
         "row_count": rows.len(),
         "rows_affected": stats.rows_affected,
         "last_insert_rowid": stats.last_insert_rowid,
+        "spilled": false,
+        "truncated": false,
+        "truncated_by": null,
+      }),
+      Collected::DryRunFile {
+        columns,
+        row_count,
+        preview,
+        would_write,
+        would_spill,
+      } => json!({
+        "columns": columns_json(columns),
+        "row_count": row_count,
+        "rows_affected": stats.rows_affected,
+        "last_insert_rowid": stats.last_insert_rowid,
+        "preview": preview,
+        "file": null,
+        "would_write": would_write.as_ref().map(|(path, format)| json!({
+          "path": path.display().to_string(),
+          "format": format.as_str(),
+        })),
+        "note": if *would_spill {
+          json!("dry run: the full result would have spilled to a file; nothing was written")
+        } else {
+          json!("dry run: the out file was not written")
+        },
         "spilled": false,
         "truncated": false,
         "truncated_by": null,
