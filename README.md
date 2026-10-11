@@ -29,14 +29,16 @@ those properties of the tool, not of the prompt.
 | Guarantee | How |
 | --- | --- |
 | `query`, `tables`, `describe` cannot write | four independent guards, each enough alone: the file is opened `SQLITE_OPEN_READ_ONLY`; `PRAGMA query_only = ON`; `query` refuses statements `sqlite3_stmt_readonly` does not call read-only (`NOT_READ_ONLY`); an authorizer refuses ATTACH/DETACH, PRAGMA assignments and `load_extension` |
-| No other file is touched | `SQLITE_LIMIT_ATTACHED = 0` on every connection (no `ATTACH`, no `VACUUM INTO`); `file:` names are literal paths, never URIs |
+| The database file is never changed by a read, and no other database is touched | `SQLITE_LIMIT_ATTACHED = 0` on every connection (no `ATTACH`, no `VACUUM INTO`); `file:` names are literal paths, never URIs. One exception to "no file is created": reading a **WAL-mode** database makes SQLite create its `-wal` and `-shm` coordination files when they are missing (SQLite cannot read a WAL database safely without them unless it is opened `immutable`, which is unsafe next to a writer). They hold no changes from the read. If the directory is read-only, the read fails with `DIRECTORY_READONLY` |
+| Only real database files | `--db` must be an existing regular file (symlinks are followed; a symlinked database is legitimate). Directories, devices and fifos are refused with `NOT_A_REGULAR_FILE` before anything is opened (a fifo can never block the call); `:memory:` and blank names are `INVALID_DB_PATH`, also for `exec --create` |
 | No schema corruption, no untrusted schema code | `SQLITE_DBCONFIG_DEFENSIVE` on, `SQLITE_DBCONFIG_TRUSTED_SCHEMA` off |
 | No extensions | extension loading is never enabled, and the `load_extension` function is denied |
 | Exactly one statement | prepared with `sqlite3_prepare_v2`; anything in its tail other than whitespace and comments is `TOO_MANY_STATEMENTS` (nothing runs); empty input is `EMPTY_STATEMENT`; a NUL byte is `NUL_IN_STATEMENT` |
 | Bounded answers | `maxRows` (default 200, hard cap 10 000), `maxBytes` (default 1 MiB, hard cap 16 MiB): when hit, `truncated: true` and `truncated_by` say so; nothing is dropped silently. Values above a hard cap are refused, not clamped |
-| Bounded time | `timeoutMs` (default 10 s, cap 300 s) is the lock wait (busy timeout) and the deadline of a progress handler that interrupts the statement (`TIMEOUT`, exit 7) |
+| Bounded time | `timeoutMs` (default 10 s, cap 300 s) is one deadline for the whole call: a busy handler stops waiting for a lock at it (`SQLITE_BUSY`, exit 5) and a progress handler, checked every 1000 VM steps, interrupts the statement at it (`TIMEOUT`, exit 7). A single VM step (one builtin call such as `printf` or `randomblob`) cannot be interrupted; the size limits below bound it |
+| Bounded memory | every connection: values at most 32 MiB (`SQLITE_LIMIT_LENGTH`, twice the hard `maxBytes`), statements at most 16 MiB, expression depth 500, compound SELECT 200 terms, LIKE patterns 10 000 bytes; the process: a hard SQLite heap limit of 256 MiB. Larger values fail with `SQLITE_TOOBIG` before they are allocated (SQLite's `printf()` returns `NULL` instead), an over-large working set with `SQLITE_NOMEM` |
 | Writes need intent | `exec` is the only write path; it is `access: write` and dangerous, so it needs `--confirm`; `--dryrun` and `LMSQL_DRYRUN=1` simulate it, `--readonly` and `LMSQL_READONLY=1` refuse it |
-| No secret echo | database paths and connection values never appear in results or errors (`<db>` replaces them) |
+| No secret echo | database paths and connection values never appear in results or errors: lmsql's own messages never contain them, and SQLite messages have the path replaced by `<db>` where it appears as a whole token |
 
 Every guard has its own test, and a mutation check (each guard removed in turn) fails a test for
 every one of them; see `durable-memory/safety.md`.
@@ -125,10 +127,10 @@ lmsql query --connection app "SELECT count(*) FROM users"
 
 | `error.code` (exit) | `data.tool_code` examples |
 | --- | --- |
-| `VALIDATION_ERROR` (2) | `SQLITE_ERROR` (syntax, unknown table/column/function; `data.offset` when known), `TOO_MANY_STATEMENTS`, `EMPTY_STATEMENT`, `NUL_IN_STATEMENT`, `LIMIT_OUT_OF_RANGE`, `CONNECTION_REQUIRED`, `CONNECTION_CONFLICT`, `UNSUPPORTED_BACKEND` |
+| `VALIDATION_ERROR` (2) | `SQLITE_ERROR` (syntax, unknown table/column/function; `data.offset` when known), `SQLITE_TOOBIG` (value or statement over the limits), `SQLITE_NOMEM` (over the 256 MiB heap), `TOO_MANY_STATEMENTS`, `EMPTY_STATEMENT`, `NUL_IN_STATEMENT`, `LIMIT_OUT_OF_RANGE`, `INVALID_DB_PATH`, `NOT_A_REGULAR_FILE`, `CONNECTION_REQUIRED`, `CONNECTION_CONFLICT`, `UNSUPPORTED_BACKEND` |
 | `NOT_FOUND` (4) | `SQLITE_CANTOPEN` (missing database), `TABLE_NOT_FOUND`, `CONNECTION_NOT_FOUND` |
 | `CONFLICT` (5) | `SQLITE_CONSTRAINT_UNIQUE` (and other constraints), `SQLITE_BUSY`, `SQLITE_LOCKED` |
-| `FORBIDDEN` (6) | `NOT_READ_ONLY`, `SQLITE_READONLY`, `SQLITE_AUTH` |
+| `FORBIDDEN` (6) | `NOT_READ_ONLY`, `SQLITE_READONLY`, `SQLITE_AUTH` (authorizer refusals, and functions such as `load_extension()` refused inside views/triggers), `DIRECTORY_READONLY` (SQLite must create a `-wal`/`-shm` or journal file next to the database and the directory is read-only) |
 | `TIMEOUT` (7) | `TIMEOUT` |
 | `COMMAND_FAILED` (1) | `SQLITE_NOTADB`, `SQLITE_CORRUPT`, `SQLITE_IOERR`, ... |
 

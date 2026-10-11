@@ -8,8 +8,10 @@ features off) over SQLite (rusqlite, bundled). Read [README.md](README.md) for t
 
 - **Read ops never write.** `query`/`tables`/`describe` keep all four guards in
   `src/backend/sqlite.rs` (read-only open, `query_only`, `sqlite3_stmt_readonly`, authorizer).
-  Each guard has its own test; a guard change needs its mutation re-checked
-  (`durable-memory/safety.md`).
+  Each guard has its own test; after changing a guard or a limit, run
+  `python3 scripts/mutation-check.py` (every mutant must fail a test; `durable-memory/safety.md`).
+- **Bounded resources.** Size limits and the heap limit in `harden`/`open`; one deadline per call
+  shared by the busy and progress handlers; `--db` must be an existing regular file.
 - **One statement per call**, found with the `sqlite3_prepare_v2` tail (`single_statement`),
   never by splitting text.
 - **No secret echo.** Paths and connection values never reach stdout/stderr; errors go through
