@@ -166,6 +166,12 @@
           "occurs": "?",
           "default": 10000,
           "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        },
+        {
+          "name": "dangerouslyBypassPermissionSettings",
+          "type": "boolean",
+          "occurs": "?",
+          "description": "Skip the settings file's permission rules for this call (connection levels, table rules, the direct-access gate, output.dir); only works when the settings file sets allow_bypass: true. The operational limits still apply"
         }
       ]
     },
@@ -229,6 +235,12 @@
           "occurs": "?",
           "default": 10000,
           "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        },
+        {
+          "name": "dangerouslyBypassPermissionSettings",
+          "type": "boolean",
+          "occurs": "?",
+          "description": "Skip the settings file's permission rules for this call (connection levels, table rules, the direct-access gate, output.dir); only works when the settings file sets allow_bypass: true. The operational limits still apply"
         }
       ]
     },
@@ -269,6 +281,12 @@
           "occurs": "?",
           "default": 10000,
           "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        },
+        {
+          "name": "dangerouslyBypassPermissionSettings",
+          "type": "boolean",
+          "occurs": "?",
+          "description": "Skip the settings file's permission rules for this call (connection levels, table rules, the direct-access gate, output.dir); only works when the settings file sets allow_bypass: true. The operational limits still apply"
         }
       ]
     },
@@ -308,6 +326,12 @@
           "occurs": "?",
           "default": 10000,
           "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        },
+        {
+          "name": "dangerouslyBypassPermissionSettings",
+          "type": "boolean",
+          "occurs": "?",
+          "description": "Skip the settings file's permission rules for this call (connection levels, table rules, the direct-access gate, output.dir); only works when the settings file sets allow_bypass: true. The operational limits still apply"
         }
       ]
     }
