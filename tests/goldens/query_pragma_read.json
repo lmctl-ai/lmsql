@@ -1,0 +1,52 @@
+{
+  "exit": 0,
+  "stdout": {
+    "columns": [
+      {
+        "name": "cid",
+        "type": null
+      },
+      {
+        "name": "name",
+        "type": null
+      },
+      {
+        "name": "type",
+        "type": null
+      },
+      {
+        "name": "notnull",
+        "type": null
+      },
+      {
+        "name": "dflt_value",
+        "type": null
+      },
+      {
+        "name": "pk",
+        "type": null
+      }
+    ],
+    "row_count": 2,
+    "rows": [
+      [
+        0,
+        "person_id",
+        "INTEGER",
+        0,
+        null,
+        1
+      ],
+      [
+        1,
+        "tag",
+        "TEXT",
+        0,
+        null,
+        2
+      ]
+    ],
+    "truncated": false,
+    "truncated_by": null
+  }
+}

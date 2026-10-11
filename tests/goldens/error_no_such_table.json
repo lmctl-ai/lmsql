@@ -1,0 +1,13 @@
+{
+  "exit": 2,
+  "stdout": {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "data": {
+        "tool_code": "SQLITE_ERROR"
+      },
+      "message": "no such table: nope"
+    },
+    "success": false
+  }
+}

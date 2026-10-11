@@ -1,0 +1,277 @@
+{
+  "schema": "cli.schema.v1",
+  "tool": "lmsql",
+  "version": "0.1.0",
+  "policy": {
+    "dryrun": true,
+    "readonly": true
+  },
+  "inputs": [
+    "flags",
+    "json"
+  ],
+  "globals": [
+    {
+      "name": "dryrun",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "Simulate write operations",
+      "aliases": [
+        "dry-run"
+      ]
+    },
+    {
+      "name": "readonly",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "Refuse to run write operations",
+      "aliases": [
+        "read-only"
+      ]
+    },
+    {
+      "name": "confirm",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "Confirm dangerous operations",
+      "aliases": [
+        "i-understand"
+      ]
+    },
+    {
+      "name": "json",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "Output as JSON"
+    },
+    {
+      "name": "help",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "Show help",
+      "aliases": [
+        "h"
+      ]
+    },
+    {
+      "name": "list",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "List operations as JSON"
+    },
+    {
+      "name": "schema",
+      "type": "boolean",
+      "occurs": "?",
+      "description": "Print schema document"
+    },
+    {
+      "name": "explain",
+      "type": "string",
+      "occurs": "?",
+      "description": "Explain an operation"
+    },
+    {
+      "name": "format",
+      "type": "string",
+      "occurs": "?",
+      "description": "Format for explain (text or json)"
+    },
+    {
+      "name": "input-json",
+      "type": "string",
+      "occurs": "?",
+      "description": "JSON document input",
+      "aliases": [
+        "inputJson"
+      ]
+    },
+    {
+      "name": "input-graphql",
+      "type": "string",
+      "occurs": "?",
+      "description": "GraphQL document input",
+      "aliases": [
+        "inputGraphql"
+      ]
+    },
+    {
+      "name": "input-file",
+      "type": "string",
+      "occurs": "?",
+      "description": "Path to file containing JSON document input",
+      "aliases": [
+        "inputFile"
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "name": "query",
+      "access": "read",
+      "returns": "object",
+      "description": "Run one read-only SQL statement and return columns and rows as JSON",
+      "params": [
+        {
+          "name": "statement",
+          "type": "string",
+          "positional": true,
+          "description": "Exactly one SQL statement (read-only: SELECT, WITH ... SELECT, read PRAGMA, EXPLAIN)"
+        },
+        {
+          "name": "db",
+          "type": "string",
+          "occurs": "?",
+          "description": "Path of the SQLite database file (or use connection)"
+        },
+        {
+          "name": "connection",
+          "type": "string",
+          "occurs": "?",
+          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+        },
+        {
+          "name": "maxRows",
+          "type": "number",
+          "occurs": "?",
+          "default": 200,
+          "description": "Return at most this many rows (1..10000); more set truncated: true"
+        },
+        {
+          "name": "maxBytes",
+          "type": "number",
+          "occurs": "?",
+          "default": 1048576,
+          "description": "Cap on the serialized rows in bytes (1..16777216); hitting it sets truncated: true"
+        },
+        {
+          "name": "timeoutMs",
+          "type": "number",
+          "occurs": "?",
+          "default": 10000,
+          "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        }
+      ]
+    },
+    {
+      "name": "exec",
+      "access": "write",
+      "returns": "object",
+      "description": "Run one SQL statement that changes data or schema; returns rows_affected and last_insert_rowid",
+      "params": [
+        {
+          "name": "statement",
+          "type": "string",
+          "positional": true,
+          "description": "Exactly one SQL statement (INSERT, UPDATE, DELETE, CREATE, ...; RETURNING rows are returned)"
+        },
+        {
+          "name": "db",
+          "type": "string",
+          "occurs": "?",
+          "description": "Path of the SQLite database file (or use connection)"
+        },
+        {
+          "name": "connection",
+          "type": "string",
+          "occurs": "?",
+          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+        },
+        {
+          "name": "create",
+          "type": "boolean",
+          "occurs": "?",
+          "description": "Create the SQLite database file if it does not exist"
+        },
+        {
+          "name": "maxRows",
+          "type": "number",
+          "occurs": "?",
+          "default": 200,
+          "description": "Return at most this many rows (1..10000); more set truncated: true"
+        },
+        {
+          "name": "maxBytes",
+          "type": "number",
+          "occurs": "?",
+          "default": 1048576,
+          "description": "Cap on the serialized rows in bytes (1..16777216); hitting it sets truncated: true"
+        },
+        {
+          "name": "timeoutMs",
+          "type": "number",
+          "occurs": "?",
+          "default": 10000,
+          "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        }
+      ]
+    },
+    {
+      "name": "tables",
+      "access": "read",
+      "returns": "object",
+      "description": "List tables and views (internal sqlite_* objects excluded)",
+      "params": [
+        {
+          "name": "db",
+          "type": "string",
+          "occurs": "?",
+          "description": "Path of the SQLite database file (or use connection)"
+        },
+        {
+          "name": "connection",
+          "type": "string",
+          "occurs": "?",
+          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+        },
+        {
+          "name": "maxRows",
+          "type": "number",
+          "occurs": "?",
+          "default": 200,
+          "description": "Return at most this many rows (1..10000); more set truncated: true"
+        },
+        {
+          "name": "timeoutMs",
+          "type": "number",
+          "occurs": "?",
+          "default": 10000,
+          "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        }
+      ]
+    },
+    {
+      "name": "describe",
+      "access": "read",
+      "returns": "object",
+      "description": "Describe one table or view: columns with type, notnull, default and primary-key position",
+      "params": [
+        {
+          "name": "table",
+          "type": "string",
+          "positional": true,
+          "description": "Table or view name (case-insensitive)"
+        },
+        {
+          "name": "db",
+          "type": "string",
+          "occurs": "?",
+          "description": "Path of the SQLite database file (or use connection)"
+        },
+        {
+          "name": "connection",
+          "type": "string",
+          "occurs": "?",
+          "description": "Name of a configured connection: the value of the environment variable LMSQL_<NAME>"
+        },
+        {
+          "name": "timeoutMs",
+          "type": "number",
+          "occurs": "?",
+          "default": 10000,
+          "description": "Abort the statement after this many milliseconds (1..300000), also the lock wait"
+        }
+      ]
+    }
+  ]
+}
