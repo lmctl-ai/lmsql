@@ -68,3 +68,32 @@ jobs:
       # cli.schema.latest.json is no longer an additive subset of it.
       - name: cli.schema.dev.json == lmsql --schema; latest is a subset
         run: cargo +stable test --locked --test lmapi -- schema_dev_file latest_is_an_additive_subset channel_files
+
+  postgres:
+    name: Test (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: lmsql_ci_pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # A missing server is a hard failure in this job (never a silent skip).
+      LMSQL_REQUIRE_PG: "1"
+      LMSQL_TEST_PG_URL: "postgres://postgres:lmsql_ci_pw@localhost:5432/postgres?sslmode=disable"
+    steps:
+      - name: Checkout lmsql
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: cargo test (with PostgreSQL)
+        run: cargo +stable test --locked
