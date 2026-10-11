@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Mutation check of lmsql's open-mode invariants: big results go to a file (spill, atomic write,
-private permissions, out checked before the SQL runs, bounded memory), the timeout, and secret
-scrubbing. Apply each mutation alone, run `cargo test --no-fail-fast`, restore the file. Every
+"""Mutation check of lmsql's invariants: big results go to a file (spill, atomic write, private
+permissions, out checked before the SQL runs, bounded memory), the timeout, secret scrubbing, and
+the permission settings (fail closed, connection and table levels, direct and bypass gates,
+output.dir containment, dry run never executing a change). Apply each mutation alone, run `cargo test --no-fail-fast`, restore the file. Every
 mutation must make at least one test fail (exit 1 lists survivors).
 
 The PostgreSQL mutant is only exercised when LMSQL_TEST_PG_URL is set (otherwise the pg tests skip
@@ -15,6 +16,9 @@ S = 'src/backend/sqlite.rs'
 P = 'src/backend/postgres/ops.rs'
 E = 'src/error.rs'
 O = 'src/output.rs'
+ST = 'src/settings.rs'
+SP = 'src/spec.rs'
+C = 'src/connection.rs'
 
 mutations = [
   # A result past the inline threshold stays inline instead of spilling to a file.
@@ -49,9 +53,49 @@ mutations = [
   ("OM8 pg cursor fetches everything at once", P,
    'format!("FETCH FORWARD {batch} FROM {CURSOR}")',
    'format!("FETCH ALL FROM {CURSOR}")'),
+  # ---- permission settings ----
+  # An invalid settings file falls back to open instead of failing closed.
+  ("PS1 invalid JSON falls back to open", ST,
+   """    let doc: Value = serde_json::from_slice(&text)
+      .map_err(|e| invalid(&path, format!("is not valid JSON ({e})")))?;""",
+   """    let Ok(doc) = serde_json::from_slice::<Value>(&text) else {
+      return Ok(Settings::open());
+    };"""),
+  # Unknown keys are ignored (a typo silently drops a restriction).
+  ("PS2 unknown keys accepted", ST,
+   "    if !allowed.contains(&key.as_str()) {",
+   "    if false && !allowed.contains(&key.as_str()) {"),
+  # A `none` connection is not refused.
+  ("PS3 connection-level gate removed", SP,
+   "  if access.max_level() == Level::None {",
+   "  if false && access.max_level() == Level::None {"),
+  # The table authorizer lets writes through to readonly tables.
+  ("PS4 table authorizer allows writes on readonly tables", S,
+   "      Level::ReadOnly => !write,",
+   "      Level::ReadOnly => true,"),
+  # --db is accepted although the settings file does not allow direct access.
+  ("PS5 direct gate removed", C,
+   "    (Some(_), None) if !settings.allow_direct && !bypass => Err(DbError::new(",
+   "    (Some(_), None) if false => Err(DbError::new("),
+  # The bypass flag works without allow_bypass.
+  ("PS6 bypass gate removed", SP,
+   "    (Some(file), true) if !settings.allow_bypass => {",
+   "    (Some(file), true) if false => {"),
+  # out may be written outside output.dir.
+  ("PS7 output.dir containment removed", O,
+   "          contain(root, &path)?;",
+   "          let _ = (root, &path);"),
+  # A SQLite dry run executes writes.
+  ("PS8 sqlite dry run executes writes", S,
+   "    if !statements.iter().any(|(_, write)| *write) {",
+   "    if true {"),
+  # A PostgreSQL dry run runs the text in a read-write session.
+  ("PS9 pg dry run not read-only", P,
+   "      read_only: true,",
+   "      read_only: false,"),
 ]
 
-files = {S, P, E, O}
+files = {S, P, E, O, ST, SP, C}
 originals = {f: pathlib.Path(f).read_text() for f in files}
 for name, f, a, b in mutations:
   assert originals[f].count(a) == 1, (name, originals[f].count(a))
