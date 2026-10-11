@@ -4,6 +4,8 @@ Short decision notes; the code and README are the reference.
 
 - [open-mode.md](open-mode.md): the CURRENT design — v1 runs any SQL; the policy seam; where the
   guards went. Start here.
+- [permissions.md](permissions.md): the settings file that restricts connections (fail closed,
+  levels, denials with a manual command); what later slices add.
 - [big-results.md](big-results.md): stateless calls; a big result is written to a file (out /
   spill), never truncated or paged.
 - [decisions.md](decisions.md): phase-1 SQLite design decisions (much still applies: type mapping,

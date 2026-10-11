@@ -4,20 +4,22 @@
 
 use std::io::Write;
 
-pub const HELP: &str = "lmsql: one SQL statement in, structured JSON out (SQLite)
+pub const HELP: &str = "lmsql: one SQL statement in, structured JSON out (SQLite, PostgreSQL)
 
 Usage:
-  lmsql query    --db FILE \"SELECT ...\"   [--max-rows N] [--max-bytes N] [--timeout-ms N]
-  lmsql exec     --db FILE \"INSERT ...\" --confirm [--create]
-  lmsql tables   --db FILE
-  lmsql describe --db FILE TABLE
-  lmsql <op> --connection NAME ...      (the database is the value of LMSQL_<NAME>)
-  lmsql <op> --input-json '{\"db\": \"x.sqlite\", \"statement\": \"select 1\"}'
+  lmsql query    --connection NAME \"SELECT ...\"  [--max-rows N] [--max-bytes N] [--timeout-ms N]
+  lmsql exec     --connection NAME \"INSERT ...\"  [--out FILE [--out-format ndjson|csv|json]]
+  lmsql tables   --connection NAME
+  lmsql describe --connection NAME TABLE
+  lmsql <op> --db FILE|postgres://... ...   (direct; with a settings file only if allow_direct)
+  lmsql <op> --input-json '{\"connection\": \"app\", \"statement\": \"select 1\"}'
   lmsql --schema | --list | --explain <op> | <op> --help
   lmsql --version
 
-Every result and every error is one JSON document on stdout. query, tables and describe
-cannot write; exec is the only write path and needs --confirm.
+Every result and every error is one JSON document on stdout. query and exec run any SQL the
+connection's permission level allows; a big result is written to a file. Connections and their
+levels (none, readonly, readwrite) come from the settings file ($LMSQL_CONFIG, else
+~/.config/lmsql/settings.json); without one, LMSQL_<NAME> names a connection and access is open.
 ";
 
 /// Handle a non-lmapi invocation.
