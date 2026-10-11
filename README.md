@@ -93,10 +93,38 @@ connections exist and how much lmsql may do with each. The file is `$LMSQL_CONFI
   equivalent command for the operator to run in their own shell with the original client, e.g.
   `sqlite3 ~/'data/app.sqlite' 'DELETE FROM t'` or `psql "$PROD_RW_DSN" -c 'DELETE FROM t'` (the
   environment variable name only, never its value).
-- **Coming next** (accepted in the file's schema where noted, not enforced yet): per-table levels
-  for SQLite (`permissions.tables`; rejected for PostgreSQL — use grants/roles), a dry-run mode,
-  a gated bypass flag (`allow_bypass`), `output.dir` containment for result files (accepted; a
-  warning says it is not enforced yet), and an operator-only `lmsql config` helper.
+- **Per-table levels (SQLite)** — `"permissions": {"default": "readwrite", "tables": {"audit_log":
+  "readonly", "secrets": "none"}}`. Enforced by the SQLite authorizer, which reports the table of
+  every read, write and DDL action whatever the SQL looks like (subqueries, views, `main.` names):
+  a `readonly` table refuses writes and DDL on it, a `none` table refuses any access, and is
+  hidden from `tables` and refused by `describe`. Unlisted tables follow the default. Names
+  compare case-insensitively. For PostgreSQL a `tables` block is rejected: use grants and roles.
+- **Dry run** — lmapi's `--dry-run` (or `LMSQL_DRYRUN=1`) estimates the blast radius and changes
+  nothing. Reads run normally (`dry_run: true, executed: true, would_change: false`). If the SQL
+  would change anything, **nothing is executed**; the response is `{"dry_run": true, "executed":
+  false, "would_change": true, "statement": "...", "plan": ...}`:
+  - SQLite asks `sqlite3_stmt_readonly` for every statement (preparing runs nothing); `plan` is
+    the `EXPLAIN QUERY PLAN` lines (null where SQLite has none, e.g. DDL); multi-statement text
+    lists each statement with its own `would_change` and plan, and none of them runs.
+  - PostgreSQL runs the text in a session where every transaction is READ ONLY; a statement the
+    server refuses there (SQLSTATE 25006) would change something. `plan` is `EXPLAIN (FORMAT
+    JSON)` (no ANALYZE, so nothing executes; null for DDL or multi-statement text) and
+    `estimated_rows` is the planner's estimate of the rows the write would touch.
+  - No file is written: `file: null` with `would_write: {path, format}` when `out` was given, or
+    a note when the result would have spilled. Permissions still apply (denied stays denied).
+  - It is an estimate: on PostgreSQL the read-only session refuses writes such as `nextval`, but
+    functions a read calls still run.
+- **Bypass** — `--dangerously-bypass-permission-settings` skips the permission rules for one call
+  (connection levels, table rules, the direct-access gate, `output.dir`) but not the operational
+  limits (`--timeout-ms`, inline thresholds), and prints one line on stderr. It only works when
+  the operator set `"allow_bypass": true`; otherwise it fails with `BYPASS_NOT_ALLOWED`. The flag
+  is visible to the LLM, so the opt-in has to live in the operator's file, not on the command
+  line. Without a settings file it is a no-op.
+- **`output.dir`** — `"output": {"dir": "~/lmsql-out"}` confines result files: an `out` path must
+  resolve inside it (canonical, symlinks and `..` followed; for a new file its nearest existing
+  parent), else `PERMISSION_DENIED`; spills go there (created 0700) instead of `$LMSQL_OUT_DIR`.
+  Checked before any SQL runs.
+- **Coming next**: an operator-only `lmsql config` helper to edit the settings file.
 
 ## Big results go to a file
 
