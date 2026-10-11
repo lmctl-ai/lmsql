@@ -29,9 +29,29 @@ run; psql/sqlite3 are not on that list, so only the operator uses them (hence `m
 - Tests run with `LMSQL_CONFIG` pinned to a nonexistent file (hermetic against a developer's own
   settings); `tests/settings.rs` is the functional matrix.
 
+## Slice 2 (0.3.0)
+
+- **Table rules (SQLite)**: the authorizer (`install_table_rules`) checks the table of every
+  Read / write / DDL action; `sqlite_*` bookkeeping is exempt. Installed only when a table rule
+  differs from the default; the handle is read-only only when no table allows writes; the
+  connection is refused outright only when nothing allows access (`TableRules::max`). Denials
+  name the table and the key. `tables` hides `none` tables; `describe` refuses them up front.
+- **Dry run** (owner's definition: estimate the blast radius, change nothing; no
+  execute-then-roll-back): reuses lmrust's dryrun global. SQLite: `sqlite3_stmt_readonly` on every
+  prepared statement; any write => none is stepped. PostgreSQL: no classifier — the text runs in a
+  READ ONLY session; SQLSTATE 25006 => would change; plan via `EXPLAIN (FORMAT JSON)` on the
+  extended protocol (one statement, no ANALYZE); `estimated_rows` from the ModifyTable's input
+  node (the ModifyTable itself always estimates 0). No out/spill file. A write that the
+  connection level forbids stays a denial.
+- **Bypass**: a per-op boolean param (flag `--dangerously-bypass-permission-settings`), gated by
+  `allow_bypass` in the operator's file because the LLM can see and pass the flag. Skips
+  levels, table rules, the direct gate and output.dir; not the limits; one stderr line.
+- **output.dir**: resolved at load (`~/`, relative to the settings file). `contain()` compares
+  canonical paths (dangling symlinks followed too; a `..` in the not-yet-existing tail is refused).
+  Spills go there. The slice-1 warning is gone.
+- Mutation check: PS1–PS9 (fail closed x2, connection gate, table authorizer, direct gate, bypass
+  gate, containment, dry run x2).
+
 ## Later slices (not started)
 
-SQLite per-table levels via the authorizer; `--dry-run` (rollback) unified with lmrust's dryrun
-global / `LMSQL_DRYRUN`; `--dangerously-bypass-permission-settings` gated by `allow_bypass`;
-`output.dir` containment; the TTY-only `lmsql config` helper; mutation-check entries for the
-settings gates.
+The TTY-only `lmsql config` helper (slice 3).

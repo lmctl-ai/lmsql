@@ -15,6 +15,14 @@ Permission settings, slice 1.
   transaction READ ONLY. Denials are `FORBIDDEN` / `PERMISSION_DENIED` with
   `error.data.manual_command` for the operator.
 - `--help` text updated (it still described the 0.1 confirm/read-only model).
+- SQLite per-table levels (`permissions.tables`) through the SQLite authorizer: `readonly` tables
+  refuse writes/DDL, `none` tables refuse any access and are hidden from `tables`.
+- Dry run (lmrust's `--dry-run` / `LMSQL_DRYRUN`): reads run normally; anything that would change
+  something is not executed and is described (`executed: false, would_change: true`, the
+  database's plan, PostgreSQL `estimated_rows`); no file is written (`would_write`).
+- `--dangerously-bypass-permission-settings` on all operations, effective only with
+  `"allow_bypass": true` (else `BYPASS_NOT_ALLOWED`); skips the permission rules, not the limits.
+- `output.dir` containment for `out` and spills (canonical paths; `PERMISSION_DENIED` outside).
 
 ## 0.2.0 (unreleased)
 
