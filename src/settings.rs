@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 pub const CONFIG_ENV: &str = "LMSQL_CONFIG";
 
 /// What lmsql may do on a connection (or, later, a table).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Level {
+  #[default]
   None,
   ReadOnly,
   ReadWrite,
@@ -53,6 +54,42 @@ impl Level {
       Level::ReadOnly => "readonly",
       Level::ReadWrite => "readwrite",
     }
+  }
+}
+
+/// Per-table levels of a SQLite connection: listed tables (names compared case-insensitively)
+/// get their own level, every other table the connection default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableRules {
+  pub default: Level,
+  /// Lower-cased table name -> level.
+  pub tables: BTreeMap<String, Level>,
+}
+
+impl TableRules {
+  pub fn new(default: Level, tables: &BTreeMap<String, Level>) -> TableRules {
+    TableRules {
+      default,
+      tables: tables.iter().map(|(t, l)| (t.to_lowercase(), *l)).collect(),
+    }
+  }
+
+  pub fn level(&self, table: &str) -> Level {
+    self
+      .tables
+      .get(&table.to_lowercase())
+      .copied()
+      .unwrap_or(self.default)
+  }
+
+  /// The most any table allows: what the database handle must permit.
+  pub fn max(&self) -> Level {
+    self.tables.values().copied().fold(self.default, Level::max)
+  }
+
+  /// Some table differs from the default: the authorizer has work to do.
+  pub fn any_rule(&self) -> bool {
+    self.tables.values().any(|l| *l != self.default)
   }
 }
 

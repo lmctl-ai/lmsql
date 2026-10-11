@@ -12,14 +12,17 @@
 //! A `file:` name is made a literal path (the bundled SQLite is built with `SQLITE_USE_URI`), so a
 //! name is never reinterpreted as a URI with its own parameters.
 
-use super::{Backend, Column, ColumnInfo, RunStats, TableDescription, TableEntry};
+use super::{Backend, Column, ColumnInfo, Mode, RunStats, TableDescription, TableEntry};
 use crate::error::DbError;
 use crate::output::Sink;
+use crate::settings::{Level, TableRules};
 use crate::values::{to_json, Limits};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Batch, Connection, OpenFlags, Statement};
 use serde_json::Value;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// VM instructions between deadline checks (a few microseconds of work).
@@ -46,25 +49,97 @@ fn wait_until_deadline(_attempt: i32) -> bool {
 
 pub struct Sqlite {
   path: PathBuf,
-  /// Settings level `readonly`: opened `SQLITE_OPEN_READ_ONLY` (never created) with
-  /// `PRAGMA query_only = ON`.
-  read_only: bool,
+  /// `read_only`: opened `SQLITE_OPEN_READ_ONLY` (never created) with `PRAGMA query_only = ON`;
+  /// `table_rules`: per-table levels enforced by the authorizer.
+  mode: Mode,
 }
 
 impl Sqlite {
   pub fn new(path: PathBuf) -> Self {
-    Sqlite {
-      path,
-      read_only: false,
-    }
+    Sqlite::with_mode(path, Mode::default())
   }
 
-  pub fn read_only(path: PathBuf) -> Self {
-    Sqlite {
-      path,
-      read_only: true,
-    }
+  pub fn with_mode(path: PathBuf, mode: Mode) -> Self {
+    Sqlite { path, mode }
   }
+
+  /// Open the handle for this call, with the table rules installed when there are any. The
+  /// returned cell names the table a rule refused, if one did.
+  fn connect(&self, limits: &Limits) -> Result<(Connection, Denied), DbError> {
+    let conn = open(&self.path, limits, self.mode.read_only)?;
+    let denied = Denied::default();
+    if let Some(rules) = &self.mode.table_rules {
+      install_table_rules(&conn, rules.clone(), denied.clone());
+    }
+    Ok((conn, denied))
+  }
+}
+
+/// The table the authorizer refused (shared with the authorizer closure).
+#[derive(Debug, Clone, Default)]
+struct Denied(Arc<Mutex<Option<String>>>);
+
+impl Denied {
+  /// Attach the refused table to an error so it becomes the permission denial.
+  fn mark(&self, mut e: DbError) -> DbError {
+    if let Some(table) = self.0.lock().ok().and_then(|mut t| t.take()) {
+      e.denied_table = Some(table);
+    }
+    e
+  }
+}
+
+/// Per-table levels through the SQLite authorizer, which reports the table of every read, write
+/// and DDL action whatever the SQL text looks like: `none` refuses any access, `readonly`
+/// refuses writes and DDL. SQLite's own `sqlite_*` tables are bookkeeping (a CREATE TABLE also
+/// writes `sqlite_schema`); the DDL action itself is what is checked.
+fn install_table_rules(conn: &Connection, rules: TableRules, denied: Denied) {
+  conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+    use AuthAction as A;
+    let (table, write) = match ctx.action {
+      A::Read { table_name, .. } => (table_name, false),
+      A::Insert { table_name }
+      | A::Delete { table_name }
+      | A::Update { table_name, .. }
+      | A::CreateTable { table_name }
+      | A::CreateTempTable { table_name }
+      | A::DropTable { table_name }
+      | A::DropTempTable { table_name }
+      | A::AlterTable { table_name, .. }
+      | A::CreateIndex { table_name, .. }
+      | A::CreateTempIndex { table_name, .. }
+      | A::DropIndex { table_name, .. }
+      | A::DropTempIndex { table_name, .. }
+      | A::CreateTrigger { table_name, .. }
+      | A::CreateTempTrigger { table_name, .. }
+      | A::DropTrigger { table_name, .. }
+      | A::DropTempTrigger { table_name, .. }
+      | A::Analyze { table_name }
+      | A::CreateVtable { table_name, .. }
+      | A::DropVtable { table_name, .. } => (table_name, true),
+      A::CreateView { view_name }
+      | A::CreateTempView { view_name }
+      | A::DropView { view_name }
+      | A::DropTempView { view_name } => (view_name, true),
+      _ => return Authorization::Allow,
+    };
+    if table.len() >= 7 && table[..7].eq_ignore_ascii_case("sqlite_") {
+      return Authorization::Allow;
+    }
+    let allowed = match rules.level(table) {
+      Level::None => false,
+      Level::ReadOnly => !write,
+      Level::ReadWrite => true,
+    };
+    if allowed {
+      Authorization::Allow
+    } else {
+      if let Ok(mut slot) = denied.0.lock() {
+        slot.get_or_insert_with(|| table.to_string());
+      }
+      Authorization::Deny
+    }
+  }));
 }
 
 /// A `file:` name is kept as a literal relative path rather than parsed as a URI.
@@ -144,8 +219,8 @@ fn run_batch(conn: &Connection, sql: &str, sink: &mut Sink) -> Result<(), DbErro
 
 impl Backend for Sqlite {
   fn run(&self, sql: &str, limits: &Limits, sink: &mut Sink) -> Result<RunStats, DbError> {
-    let conn = open(&self.path, limits, self.read_only)?;
-    run_batch(&conn, sql, sink)?;
+    let (conn, denied) = self.connect(limits)?;
+    run_batch(&conn, sql, sink).map_err(|e| denied.mark(e))?;
     Ok(RunStats {
       rows_affected: conn.changes(),
       last_insert_rowid: Some(conn.last_insert_rowid()),
@@ -157,7 +232,7 @@ impl Backend for Sqlite {
     schema: Option<&str>,
     limits: &Limits,
   ) -> Result<(Vec<TableEntry>, bool), DbError> {
-    let conn = open(&self.path, limits, self.read_only)?;
+    let (conn, _) = self.connect(limits)?;
     // SQLite's attached schema name; `main` by default.
     let db = schema.unwrap_or("main");
     let mut stmt = conn.prepare(&format!(
@@ -189,7 +264,7 @@ impl Backend for Sqlite {
     table: &str,
     limits: &Limits,
   ) -> Result<TableDescription, DbError> {
-    let conn = open(&self.path, limits, self.read_only)?;
+    let (conn, _) = self.connect(limits)?;
     let found: Option<(String, String)> = conn
       .prepare(
         "SELECT name, type FROM sqlite_schema \

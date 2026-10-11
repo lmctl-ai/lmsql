@@ -457,3 +457,93 @@ fn pg_missing_login_variable_and_none_without_connecting() {
   assert!(manual.contains("<the dsn of connection pg in "), "{manual}");
   assert!(!out.text().contains(&pg.rw), "{}", out.text());
 }
+
+// ---- SQLite per-table rules --------------------------------------------------------------------
+
+#[test]
+fn sqlite_table_rules() {
+  let st = Setup::new();
+  rusqlite::Connection::open(st.path("app.db"))
+    .unwrap()
+    .execute_batch(
+      "CREATE TABLE audit(x TEXT); INSERT INTO audit VALUES ('a');
+       CREATE TABLE secrets(x TEXT); INSERT INTO secrets VALUES ('s');
+       CREATE VIEW leaky AS SELECT x FROM secrets;",
+    )
+    .unwrap();
+  let settings = |default: &str| {
+    json!({"version": 1, "connections": {"app": {"driver": "sqlite", "path": "app.db",
+      "permissions": {"default": default, "tables": {"audit": "readonly", "Secrets": "none"}}}}})
+  };
+  // (default, op args after --connection app, denied table or "" when allowed)
+  let cases: &[(&str, &[&str], &str)] = &[
+    ("readwrite", &["query", "SELECT x FROM audit"], ""),
+    ("readwrite", &["exec", "INSERT INTO t VALUES ('w')"], ""),
+    (
+      "readwrite",
+      &["exec", "INSERT INTO audit VALUES ('w')"],
+      "audit",
+    ),
+    ("readwrite", &["exec", "UPDATE AUDIT SET x = 'u'"], "audit"),
+    ("readwrite", &["exec", "DROP TABLE audit"], "audit"),
+    (
+      "readwrite",
+      &["exec", "CREATE INDEX i ON audit(x)"],
+      "audit",
+    ),
+    ("readwrite", &["query", "SELECT x FROM secrets"], "secrets"),
+    (
+      "readwrite",
+      &["query", "SELECT (SELECT count(*) FROM main.secrets)"],
+      "secrets",
+    ),
+    ("readwrite", &["query", "SELECT x FROM leaky"], "secrets"),
+    ("readwrite", &["describe", "secrets"], "secrets"),
+    ("readwrite", &["describe", "audit"], ""),
+    // Default readonly: an unlisted table follows the default.
+    ("readonly", &["query", "SELECT x FROM t"], ""),
+    ("readonly", &["exec", "INSERT INTO t VALUES ('w')"], "?"),
+    // Default none, but some table readable: only that table.
+    ("none", &["query", "SELECT x FROM audit"], ""),
+    ("none", &["query", "SELECT x FROM t"], "t"),
+  ];
+  for (default, op, denied) in cases {
+    st.write(&settings(default));
+    let mut args = vec![op[0], "--connection", "app"];
+    args.extend(&op[1..]);
+    let out = st.run(&args, &[]);
+    if denied.is_empty() {
+      assert_eq!(out.code, 0, "{default} {op:?}: {}", out.text());
+      continue;
+    }
+    assert_eq!(
+      code(&out),
+      (6, "PERMISSION_DENIED".into()),
+      "{default} {op:?}: {}",
+      out.text()
+    );
+    let message = out.json()["error"]["message"].as_str().unwrap().to_string();
+    if *denied != "?" {
+      assert!(
+        message.contains(&format!("table {denied:?}")),
+        "{default} {op:?}: {message}"
+      );
+    }
+  }
+  // Nothing was changed by the refused statements.
+  let conn = rusqlite::Connection::open(st.path("app.db")).unwrap();
+  let audit: i64 = conn
+    .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+    .unwrap();
+  assert_eq!(audit, 1);
+  // `tables` hides `none` tables.
+  st.write(&settings("readwrite"));
+  let out = st.run(&["tables", "--connection", "app"], &[]);
+  let names: Vec<String> = out.json()["tables"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|t| t["name"].as_str().unwrap().to_string())
+    .collect();
+  assert_eq!(names, ["audit", "leaky", "t"]);
+}

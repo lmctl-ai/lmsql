@@ -6,6 +6,7 @@ pub mod sqlite;
 
 use crate::error::DbError;
 use crate::output::Sink;
+use crate::settings::TableRules;
 use crate::values::Limits;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -20,14 +21,11 @@ pub enum Target {
 }
 
 impl Target {
-  /// The backend; `read_only` (settings level `readonly`) opens SQLite read-only with
-  /// `query_only`, and starts every PostgreSQL transaction READ ONLY.
-  pub fn backend(&self, read_only: bool) -> Box<dyn Backend> {
-    match (self, read_only) {
-      (Target::Sqlite(path), false) => Box::new(sqlite::Sqlite::new(path.clone())),
-      (Target::Sqlite(path), true) => Box::new(sqlite::Sqlite::read_only(path.clone())),
-      (Target::Postgres(dsn), false) => Box::new(postgres::Postgres::new(dsn.clone())),
-      (Target::Postgres(dsn), true) => Box::new(postgres::Postgres::read_only(dsn.clone())),
+  /// The backend for this call's [`Mode`].
+  pub fn backend(&self, mode: Mode) -> Box<dyn Backend> {
+    match self {
+      Target::Sqlite(path) => Box::new(sqlite::Sqlite::with_mode(path.clone(), mode)),
+      Target::Postgres(dsn) => Box::new(postgres::Postgres::with_mode(dsn.clone(), mode)),
     }
   }
 
@@ -48,6 +46,17 @@ impl Target {
       },
     }
   }
+}
+
+/// How the settings restrict a call's database handle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Mode {
+  /// Level `readonly` everywhere: SQLite opened read-only with `query_only`; every PostgreSQL
+  /// transaction READ ONLY.
+  pub read_only: bool,
+  /// SQLite per-table levels, enforced by the authorizer (`None`: no table rule differs from the
+  /// connection default).
+  pub table_rules: Option<TableRules>,
 }
 
 /// One result column: its name and declared type (`null` for expressions).

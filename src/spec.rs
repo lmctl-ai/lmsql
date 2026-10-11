@@ -187,7 +187,7 @@ fn env(name: &str) -> Option<String> {
 fn with_backend(
   params: &Record,
   intent: Intent<'_>,
-  f: impl FnOnce(&dyn Backend, &Limits) -> Result<Value, DbError>,
+  f: impl FnOnce(&dyn Backend, &Limits, &dyn Fn(&str) -> bool) -> Result<Value, DbError>,
 ) -> Result<Value, CliError> {
   let settings = Settings::load(&env, &mut |warning| eprintln!("{warning}"))
     .map_err(|e| e.into_cli_error(&[]))?;
@@ -200,13 +200,20 @@ fn with_backend(
   )
   .map_err(|e| e.into_cli_error(&secrets))?;
   secrets.extend(target.secrets());
-  if access.level == Level::None {
+  if access.max_level() == Level::None {
     return Err(access.denied(intent).into_cli_error(&secrets));
   }
+  if let Intent::Describe(table) = intent {
+    if access.rule.is_some() && access.level_of(table) == Level::None {
+      return Err(access.denied_table(table, intent).into_cli_error(&secrets));
+    }
+  }
   let limits = limits(params).map_err(|e| e.into_cli_error(&secrets))?;
-  let backend = target.backend(access.level == Level::ReadOnly);
+  let backend = target.backend(access.mode());
+  // A `none` table is hidden from `tables`.
+  let hidden = |name: &str| access.rule.is_some() && access.level_of(name) == Level::None;
   // Results carry user data only (rows, names, counts); error messages are scrubbed.
-  f(backend.as_ref(), &limits)
+  f(backend.as_ref(), &limits, &hidden)
     .map_err(|e| access.map_error(e, intent))
     .map_err(|e| e.into_cli_error(&secrets))
 }
@@ -219,7 +226,7 @@ fn statement(params: &Record) -> &str {
 /// (which allows everything in v1) and run it, returning one shape.
 fn run_sql(op: &str, params: &Record) -> Result<Value, CliError> {
   let sql = statement(params).to_string();
-  with_backend(params, Intent::Sql(statement(params)), |b, l| {
+  with_backend(params, Intent::Sql(statement(params)), |b, l, _| {
     OpenPolicy::load().allow(op, &sql)?;
     // Checked before the SQL runs: a bad out path must not follow a committed write.
     let config = OutputConfig::new(
@@ -272,8 +279,9 @@ pub fn spec() -> CliSpec<Policy> {
         Access::Read,
         op("tables").description.unwrap_or_default(),
         |params, _| {
-          with_backend(params, Intent::Tables, |b, l| {
-            let (tables, truncated) = b.tables(text(params, "schema"), l)?;
+          with_backend(params, Intent::Tables, |b, l, hidden| {
+            let (mut tables, truncated) = b.tables(text(params, "schema"), l)?;
+            tables.retain(|t| !hidden(&t.name));
             Ok(json!({
               "tables": tables.iter().map(|t| t.to_json()).collect::<Vec<_>>(),
               "truncated": truncated,
@@ -290,7 +298,7 @@ pub fn spec() -> CliSpec<Policy> {
         op("describe").description.unwrap_or_default(),
         |params, _| {
           let table = text(params, "table").unwrap_or_default();
-          with_backend(params, Intent::Describe(table), |b, l| {
+          with_backend(params, Intent::Describe(table), |b, l, _| {
             b.describe(text(params, "schema"), table, l)
               .map(|d| d.to_json())
           })
