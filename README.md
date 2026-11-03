@@ -1,3 +1,7 @@
+> **Archived — 2026-11-02.** This legacy lmapi tool is retired following consolidation on the lmcode host contract and retirement of lmapi schema-module imports in lmscript.
+> Replacement: [lmclient for JDBC SQL, including SQLite and PostgreSQL](https://github.com/lmctl-ai/lmclient).
+> Source, history, tags and existing releases are retained for reference. Replacement APIs and policy behavior differ; follow the successor documentation.
+
 # lmsql
 
 One SQL request in, structured JSON out. `lmsql` is a small, **stateless** database CLI for LLMs
